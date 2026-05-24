@@ -1,0 +1,31 @@
+# --- VPN configs: NUNCA subir ---
+# Cada .ovpn lleva claves privadas o credenciales del proveedor.
+*.ovpn
+inbox/*
+ok/*
+needs_auth/*
+trash/*
+# Preservar los directorios vacíos en el repo
+!inbox/.gitkeep
+!ok/.gitkeep
+!needs_auth/.gitkeep
+!trash/.gitkeep
+
+# --- Estado runtime ---
+.riflle2_cache.json
+.last_check.log
+.riffle2.log
+.riffle2.pid
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1608 @@
+#!/usr/bin/env python3
+"""riflle21_ui — riffle2.1: multi-VPN simultáneo con shells por país.
+
+Cada conexión OpenVPN vive en su propio network namespace (rfl-<name>). La
+shell asociada se lanza con `ip netns exec rfl-<name> bash`, así su tráfico
+sale por la VPN sin pelearse con las otras ni con el host.
+
+Lanzar como root:
+    sudo python3 riflle21_ui.py
+Cleanup de huérfanos tras un kill -9:
+    sudo python3 riflle21_ui.py --cleanup-orphans
+
+UI por defecto en http://0.0.0.0:8061/
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import uvicorn
+from fastapi import (FastAPI, HTTPException, UploadFile, File,
+                     WebSocket, WebSocketDisconnect)
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+
+# Reutilizamos lógica de la v1 (sin tocar riflle2.py / riflle2_ui.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import riflle2          # type: ignore
+import riflle21_net as net   # type: ignore
+
+ROOT = Path(__file__).resolve().parent
+OK_DIR = ROOT / "ok"
+INBOX = ROOT / "inbox"
+CACHE_FILE = ROOT / ".riflle2_cache.json"
+HOST = os.environ.get("RIFLLE21_HOST", "0.0.0.0")
+PORT = int(os.environ.get("RIFLLE21_PORT", "8061"))
+
+CONNECT_TIMEOUT_S = 50
+
+CHECK_LOG = ROOT / ".last_check.log"
+
+# Borra ANSI color codes (riflle2.py imprime \033[32mOK\033[0m etc.) para que
+# el log se vea limpio en la UI web.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+# ---------------------------------------------------------------------------
+# Modelo
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Room:
+    name: str
+    netns: str
+    ovpn_path: str
+    subnet: str
+    host_ip: str
+    ns_ip: str
+    veth_host: str
+    veth_ns: str
+    state: str = "creating"   # creating | connecting | connected | error | disconnecting
+    ip: str = ""
+    country_code: str = ""
+    country: str = ""
+    started_at: float = 0.0
+    error: str = ""
+    log_tail: list[str] = field(default_factory=list)
+    proc: Optional[subprocess.Popen] = field(default=None, repr=False)
+    net_torn_down: bool = False   # True una vez se limpió netns/veth/iptables
+
+    def to_dict(self) -> dict:
+        # NO usar dataclasses.asdict: hace deepcopy y subprocess.Popen contiene
+        # un _thread.lock que no es picklable → revienta el endpoint /api/rooms
+        # y la UI se queda en CREATING para siempre.
+        return {
+            "name": self.name,
+            "netns": self.netns,
+            "ovpn_path": self.ovpn_path,
+            "subnet": self.subnet,
+            "host_ip": self.host_ip,
+            "ns_ip": self.ns_ip,
+            "veth_host": self.veth_host,
+            "veth_ns": self.veth_ns,
+            "state": self.state,
+            "ip": self.ip,
+            "country_code": self.country_code,
+            "country": self.country,
+            "started_at": self.started_at,
+            "error": self.error,
+            "log_tail": list(self.log_tail),
+            "uptime_s": int(time.time() - self.started_at) if self.started_at else 0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# RoomManager
+# ---------------------------------------------------------------------------
+
+class RoomManager:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.rooms: dict[str, Room] = {}
+        self.baseline_ip = ""
+        self._orig_ip_forward = "0"
+
+    # -- bootstrap / shutdown --------------------------------------------
+
+    def bootstrap(self) -> None:
+        """Llamar al arrancar el servidor. Idempotente."""
+        if os.geteuid() != 0:
+            print("AVISO: no estás como root. ip netns / iptables fallarán.",
+                  file=sys.stderr)
+            return
+        self._orig_ip_forward = net.ensure_ip_forward()
+        net.ensure_iptables_chains()
+        print(f"[riflle21] ip_forward previo={self._orig_ip_forward} → ahora=1")
+        print(f"[riflle21] cadenas iptables {net.RIFFLE21_NAT}/{net.RIFFLE21_FWD} OK")
+        ip, code, country = riflle2.baseline_geo()
+        self.baseline_ip = ip
+        print(f"[riflle21] baseline host: {ip} [{code}] {country}")
+
+    def shutdown(self) -> None:
+        """Limpia todos los rooms y revierte iptables/ip_forward."""
+        with self.lock:
+            names = list(self.rooms.keys())
+        if names:
+            print(f"[riflle21] saliendo: limpiando {len(names)} room(s)")
+        for n in names:
+            try:
+                self.destroy_room(n)
+            except Exception as exc:
+                print(f"[riflle21] error destruyendo {n}: {exc}", file=sys.stderr)
+        if os.geteuid() == 0:
+            net.teardown_iptables_chains()
+            # restaurar ip_forward original sólo si lo modificamos
+            try:
+                net.write_ip_forward(self._orig_ip_forward)
+            except net.NetworkError:
+                pass
+
+    # -- API pública ------------------------------------------------------
+
+    def snapshot(self) -> list[dict]:
+        with self.lock:
+            return [r.to_dict() for r in self.rooms.values()]
+
+    def get_room(self, name: str) -> Optional[Room]:
+        with self.lock:
+            return self.rooms.get(name)
+
+    def create_room(self, name: str, ovpn_path: Path) -> Room:
+        net.validate_name(name)
+        with self.lock:
+            if name in self.rooms:
+                raise HTTPException(409, f"room '{name}' ya existe")
+            taken = {r.subnet for r in self.rooms.values()}
+            subnet, host_ip, ns_ip = net.alloc_subnet(name, taken)
+            netns = net.netns_name(name)
+            veth_host, veth_ns = net.veth_names(name)
+            room = Room(name=name, netns=netns, ovpn_path=str(ovpn_path),
+                        subnet=subnet, host_ip=host_ip, ns_ip=ns_ip,
+                        veth_host=veth_host, veth_ns=veth_ns,
+                        state="creating", started_at=time.time())
+            self.rooms[name] = room
+
+        # Setup de red + arranque openvpn se hace fuera del lock en un hilo.
+        threading.Thread(target=self._setup_and_connect, args=(room,),
+                         daemon=True).start()
+        return room
+
+    def destroy_room(self, name: str) -> None:
+        with self.lock:
+            room = self.rooms.get(name)
+            if not room:
+                return
+            room.state = "disconnecting"
+            proc = room.proc
+            already_clean = room.net_torn_down
+            # Marcamos AHORA, dentro del lock — si _cleanup_failed corre en
+            # paralelo (timeout openvpn justo cuando el usuario pulsa X), ve
+            # el flag y se salta su teardown. Antes ambos hilos veían False
+            # y borraban los mismos recursos, generando "Bad rule" warns.
+            room.net_torn_down = True
+
+        # 1. matar openvpn (si está vivo)
+        if proc is not None:
+            try:
+                riflle2.kill_proc_group(proc)
+            except Exception:
+                pass
+
+        # 2. teardown net (best-effort) — sólo si no se limpió ya
+        if not already_clean:
+            errors = net.destroy_room_netns(room.netns, room.subnet, room.veth_host)
+            for e in errors:
+                print(f"[riflle21] cleanup warn ({name}): {e}", file=sys.stderr)
+
+        with self.lock:
+            self.rooms.pop(name, None)
+
+    # -- internals --------------------------------------------------------
+
+    def _push_log(self, room: Room, line: str) -> None:
+        with self.lock:
+            room.log_tail.append(line.rstrip())
+            room.log_tail = room.log_tail[-30:]
+
+    def _setup_and_connect(self, room: Room) -> None:
+        # 1. crear netns + veth + NAT
+        try:
+            net.create_room_netns(room.netns, room.subnet,
+                                  room.host_ip, room.ns_ip,
+                                  room.veth_host, room.veth_ns)
+        except net.NetworkError as exc:
+            with self.lock:
+                room.state = "error"
+                room.error = f"setup red: {exc}"
+            return
+
+        with self.lock:
+            room.state = "connecting"
+
+        # 2. preparar comando openvpn dentro del netns
+        try:
+            text = Path(room.ovpn_path).read_text(errors="replace")
+        except OSError as exc:
+            with self.lock:
+                room.state = "error"
+                room.error = f"leer ovpn: {exc}"
+            return
+        force_rg = not (riflle2.has_redirect_gateway(text)
+                        or riflle2.PATCH_MARKER in text)
+
+        cmd = [
+            "ip", "netns", "exec", room.netns,
+            riflle2.OPENVPN_BIN,
+            "--config", room.ovpn_path,
+            "--dev", "tun0",
+            "--connect-timeout", "10",
+            "--connect-retry", "0",
+            "--resolv-retry", "0",
+            "--pull-filter", "ignore", "block-outside-dns",
+            "--verb", "3",
+        ]
+        if force_rg:
+            cmd += ["--redirect-gateway", "def1"]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd="/tmp",
+                preexec_fn=os.setsid,
+            )
+        except OSError as exc:
+            with self.lock:
+                room.state = "error"
+                room.error = f"openvpn spawn: {exc}"
+            self._cleanup_failed(room)
+            return
+
+        with self.lock:
+            room.proc = proc
+
+        # 3. esperar handshake
+        start = time.monotonic()
+        ok = False
+        dead_reason = ""
+        while time.monotonic() - start < CONNECT_TIMEOUT_S:
+            assert proc.stdout is not None
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+            self._push_log(room, line)
+            if riflle2.OK_MARKER in line:
+                ok = True
+                break
+            for m in riflle2.DEAD_MARKERS:
+                if m in line:
+                    dead_reason = m
+                    break
+            if dead_reason:
+                break
+
+        if not ok:
+            try:
+                riflle2.kill_proc_group(proc)
+            except Exception:
+                pass
+            with self.lock:
+                room.state = "error"
+                room.error = dead_reason or "timeout esperando handshake"
+                room.proc = None
+            self._cleanup_failed(room)
+            return
+
+        # 4. dejar que se asienten rutas, consultar geo dentro del netns
+        time.sleep(2)
+        ip, code, country = net.query_geo_in_ns(room.netns, timeout=8)
+        if not ip:
+            try:
+                riflle2.kill_proc_group(proc)
+            except Exception:
+                pass
+            with self.lock:
+                room.state = "error"
+                room.error = "túnel arriba pero geo no responde en netns"
+                room.proc = None
+            self._cleanup_failed(room)
+            return
+
+        if self.baseline_ip and ip == self.baseline_ip:
+            try:
+                riflle2.kill_proc_group(proc)
+            except Exception:
+                pass
+            with self.lock:
+                room.state = "error"
+                room.error = f"VPN no enruta (IP en netns = baseline {ip})"
+                room.proc = None
+            self._cleanup_failed(room)
+            return
+
+        # 5. todo OK; drenar log en background
+        threading.Thread(target=self._drain_log, args=(room, proc),
+                         daemon=True).start()
+
+        with self.lock:
+            room.state = "connected"
+            room.ip = ip
+            room.country_code = code
+            room.country = country
+
+    def _drain_log(self, room: Room, proc: subprocess.Popen) -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self._push_log(room, line)
+            if proc.poll() is not None:
+                break
+        # Si el proceso muere por su cuenta, marcamos error y limpiamos red
+        with self.lock:
+            if room.proc is proc and room.state == "connected":
+                room.state = "error"
+                room.error = "openvpn salió inesperadamente"
+                room.proc = None
+        self._cleanup_failed(room)
+
+    def _cleanup_failed(self, room: Room) -> None:
+        """Best-effort de teardown si el room queda en error a medio camino.
+        El room sigue en self.rooms para que el usuario vea el error en la UI;
+        el DELETE explícito posterior será silencioso porque net_torn_down=True."""
+        with self.lock:
+            if room.net_torn_down:
+                return
+            # Claim inmediato bajo lock para evitar race con destroy_room
+            # (ver comentario en destroy_room).
+            room.net_torn_down = True
+        errors = net.destroy_room_netns(room.netns, room.subnet, room.veth_host)
+        for e in errors:
+            print(f"[riflle21] cleanup-failed warn ({room.name}): {e}",
+                  file=sys.stderr)
+
+
+manager = RoomManager()
+
+# Estado global del proceso de validación lanzado por /api/check-inbox.
+# Sólo permitimos una validación a la vez (riflle2.py es secuencial igualmente).
+_check_proc: Optional[subprocess.Popen] = None
+_check_log_fh = None   # fd abierto a CHECK_LOG mientras la validación corre
+_check_lock = threading.Lock()
+
+
+def _check_running() -> bool:
+    with _check_lock:
+        return _check_proc is not None and _check_proc.poll() is None
+
+
+# ---------------------------------------------------------------------------
+# Carga de VPNs disponibles (reutilizamos cache de v1)
+# ---------------------------------------------------------------------------
+
+def list_vpns() -> list[dict]:
+    """Sólo lista ficheros .ovpn ya validados (en ok/). Los de inbox/ no aparecen
+    en el dropdown hasta que pasen el check — así el usuario no puede seleccionar
+    una VPN rota."""
+    cache: dict = {}
+    if CACHE_FILE.exists():
+        try:
+            cache = json.loads(CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    entries: list[dict] = []
+    if OK_DIR.exists():
+        for p in sorted(OK_DIR.iterdir()):
+            if p.is_file() and p.suffix == ".ovpn":
+                digest = riflle2.sha1_of(p)
+                c = cache.get(digest, {})
+                entries.append({
+                    "name": p.name,
+                    "path": str(p),
+                    "source": "ok",
+                    "country_code": (c.get("country_code") or "").lower(),
+                    "country": c.get("country") or "",
+                    "bandwidth_mbps": float(c.get("bandwidth_mbps") or 0.0),
+                    "validated": c.get("status") == "ok",
+                })
+    return entries
+
+
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._一-鿿-]+")
+
+
+def safe_filename(name: str) -> str:
+    base = Path(name).name
+    base = SAFE_NAME_RE.sub("_", base)
+    if not base.endswith(".ovpn"):
+        base += ".ovpn"
+    return base[:200]
+
+
+# ---------------------------------------------------------------------------
+# PTY (con soporte de netns)
+# ---------------------------------------------------------------------------
+
+class PTYSession:
+    def __init__(self) -> None:
+        self.pid: int = -1
+        self.fd: int = -1
+
+    def start(self, cwd: str = "/root", netns: Optional[str] = None) -> None:
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.setdefault("HOME", cwd)
+            try:
+                os.chdir(cwd)
+            except OSError:
+                os.chdir("/")
+            if netns:
+                # Lanzar bash dentro del netns
+                os.execvp("ip", ["ip", "netns", "exec", netns, "bash", "--login"])
+            else:
+                os.execvp("bash", ["bash", "--login"])
+        self.pid = pid
+        self.fd = fd
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def resize(self, rows: int, cols: int) -> None:
+        if self.fd < 0:
+            return
+        try:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def read_blocking(self, maxbytes: int = 8192, poll_timeout: float = 0.05) -> bytes:
+        if self.fd < 0:
+            return b""
+        try:
+            r, _, _ = select.select([self.fd], [], [], poll_timeout)
+            if not r:
+                return b""
+            return os.read(self.fd, maxbytes)
+        except OSError:
+            return b""
+
+    def write(self, data: bytes) -> None:
+        if self.fd < 0:
+            return
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        if self.pid > 0:
+            try:
+                os.kill(self.pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+        if self.fd > 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.pid = -1
+        self.fd = -1
+
+
+# ---------------------------------------------------------------------------
+# FastAPI
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="riffle2.1 — multi-VPN")
+
+
+class RoomBody(BaseModel):
+    name: str
+    path: str
+
+
+NOCACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML, headers=NOCACHE_HEADERS)
+
+
+@app.get("/shell", response_class=HTMLResponse)
+def shell_page() -> HTMLResponse:
+    return HTMLResponse(SHELL_HTML, headers=NOCACHE_HEADERS)
+
+
+@app.get("/api/vpns")
+def api_vpns() -> JSONResponse:
+    return JSONResponse(list_vpns())
+
+
+@app.get("/api/rooms")
+def api_rooms_list() -> JSONResponse:
+    return JSONResponse(manager.snapshot())
+
+
+@app.post("/api/rooms", status_code=202)
+def api_rooms_create(body: RoomBody) -> JSONResponse:
+    if os.geteuid() != 0:
+        raise HTTPException(503, "el servidor no está como root; ip netns falla")
+    p = Path(body.path)
+    if not p.exists() or p.suffix != ".ovpn":
+        raise HTTPException(400, "fichero no encontrado o no es .ovpn")
+    if not str(p.resolve()).startswith(str(ROOT.resolve())):
+        raise HTTPException(403, "path fuera del proyecto")
+    try:
+        room = manager.create_room(body.name, p)
+    except net.NetworkError as exc:
+        raise HTTPException(400, str(exc))
+    return JSONResponse(room.to_dict())
+
+
+@app.delete("/api/rooms/{name}")
+def api_rooms_delete(name: str) -> JSONResponse:
+    room = manager.get_room(name)
+    if not room:
+        raise HTTPException(404, f"no existe room '{name}'")
+    manager.destroy_room(name)
+    return JSONResponse({"ok": True, "name": name})
+
+
+# Cache per-room para realip (evita martillear ip-api.com)
+_REALIP_CACHE: dict[str, dict] = {}
+_REALIP_LOCK = threading.Lock()
+_REALIP_TTL = 4.0
+
+
+@app.get("/api/rooms/{name}/realip")
+def api_room_realip(name: str, force: bool = False) -> JSONResponse:
+    room = manager.get_room(name)
+    if not room:
+        raise HTTPException(404, f"no existe room '{name}'")
+
+    now = time.time()
+    with _REALIP_LOCK:
+        c = _REALIP_CACHE.get(name, {"ip": "", "country_code": "", "country": "", "ts": 0.0})
+        age = now - c["ts"] if c["ts"] else None
+        if (not force and c["ip"] and age is not None and age < _REALIP_TTL):
+            return JSONResponse({**c, "age_s": round(age, 1),
+                                  "cached": True, "live": True})
+
+    ip, code, country = net.query_geo_in_ns(room.netns, timeout=6)
+    with _REALIP_LOCK:
+        if ip:
+            _REALIP_CACHE[name] = {"ip": ip, "country_code": code,
+                                    "country": country, "ts": time.time()}
+        c = _REALIP_CACHE.get(name, {"ip": "", "country_code": "", "country": "", "ts": 0.0})
+        age2 = time.time() - c["ts"] if c["ts"] else None
+        return JSONResponse({
+            "ip": c["ip"], "country_code": c["country_code"],
+            "country": c["country"],
+            "age_s": round(age2, 1) if age2 else None,
+            "cached": False, "live": bool(ip),
+        })
+
+
+# Cache para realip del HOST (sin netns)
+_HOST_REALIP = {"ip": "", "country_code": "", "country": "", "ts": 0.0}
+
+
+@app.get("/api/realip")
+def api_realip_host(force: bool = False) -> JSONResponse:
+    now = time.time()
+    with _REALIP_LOCK:
+        age = now - _HOST_REALIP["ts"] if _HOST_REALIP["ts"] else None
+        if not force and _HOST_REALIP["ip"] and age is not None and age < _REALIP_TTL:
+            return JSONResponse({**_HOST_REALIP, "age_s": round(age, 1),
+                                  "cached": True, "live": True})
+    ip, code, country = riflle2.query_geo(timeout=6)
+    with _REALIP_LOCK:
+        if ip:
+            _HOST_REALIP.update({"ip": ip, "country_code": code,
+                                  "country": country, "ts": time.time()})
+        age2 = time.time() - _HOST_REALIP["ts"] if _HOST_REALIP["ts"] else None
+        return JSONResponse({
+            "ip": _HOST_REALIP["ip"], "country_code": _HOST_REALIP["country_code"],
+            "country": _HOST_REALIP["country"],
+            "age_s": round(age2, 1) if age2 else None,
+            "cached": False, "live": bool(ip),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Upload de .ovpn + lanzar validación en background
+# ---------------------------------------------------------------------------
+
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)) -> JSONResponse:
+    if not (file.filename or "").lower().endswith(".ovpn"):
+        raise HTTPException(400, "el fichero debe tener extensión .ovpn")
+    INBOX.mkdir(exist_ok=True)
+    safe = safe_filename(file.filename)
+    target = INBOX / safe
+    n = 1
+    while target.exists():
+        target = INBOX / f"{safe[:-5]}.dup{n}.ovpn"
+        n += 1
+    data = await file.read()
+    if len(data) > 2_000_000:
+        raise HTTPException(413, "fichero demasiado grande (>2MB)")
+    target.write_bytes(data)
+    return JSONResponse({"ok": True, "saved": target.name, "size": len(data)})
+
+
+@app.post("/api/check-inbox")
+def api_check_inbox(bandwidth: bool = True, timeout: int = 10) -> JSONResponse:
+    """Lanza riflle2.py check en background contra ./inbox/.
+    Rechaza si ya hay una validación corriendo (sólo una a la vez).
+
+    Query params:
+      bandwidth (default true)  → mide Mbps de cada VPN que conecta.
+      timeout   (default 10s)   → segundos por intento de handshake openvpn;
+                                   pasado ese tiempo descarta y va a la siguiente.
+
+    Siempre pasa --inbox-only: la UI no quiere re-procesar todos los ok/ cuando
+    el usuario sube 4 ficheros nuevos. Para re-medir toda ok/, usar la CLI.
+    """
+    global _check_proc, _check_log_fh
+    if os.geteuid() != 0:
+        raise HTTPException(503, "necesita ejecutarse como root")
+    # Clamp seguro: 3..120s
+    timeout = max(3, min(int(timeout), 120))
+    with _check_lock:
+        if _check_proc is not None and _check_proc.poll() is None:
+            raise HTTPException(
+                409, f"ya hay una validación corriendo (PID {_check_proc.pid})"
+            )
+        # Cerrar fd del run anterior si quedó abierto
+        if _check_log_fh is not None:
+            try:
+                _check_log_fh.close()
+            except OSError:
+                pass
+            _check_log_fh = None
+
+        script = ROOT / "riflle2.py"
+        # -u → unbuffered: si no, las prints() del subprocess se quedan en su
+        # buffer de stdout hasta que se llena (~8KB) o termine. La UI hace
+        # poll del fichero y se vería "siempre validando".
+        cmd = ["python3", "-u", str(script),
+               "--timeout", str(timeout), "--inbox-only"]
+        if bandwidth:
+            cmd.append("--bandwidth")
+        cmd.append("check")
+        # 'w' trunca el fichero — empezamos limpios cada run.
+        _check_log_fh = open(CHECK_LOG, "w")
+        _check_proc = subprocess.Popen(
+            cmd,
+            stdout=_check_log_fh,
+            stderr=subprocess.STDOUT,
+            cwd=str(ROOT),
+            start_new_session=True,
+        )
+        pid = _check_proc.pid
+    return JSONResponse({"ok": True, "pid": pid, "log": str(CHECK_LOG),
+                          "cmd": " ".join(cmd)})
+
+
+@app.get("/api/check-log")
+def api_check_log(offset: int = 0) -> JSONResponse:
+    """Devuelve el contenido nuevo del log de validación desde `offset` bytes y
+    si el proceso sigue corriendo. La UI hace polling con el último `offset`
+    devuelto para mostrar el log incrementalmente."""
+    with _check_lock:
+        running = _check_proc is not None and _check_proc.poll() is None
+        pid = _check_proc.pid if _check_proc is not None else None
+        rc = (_check_proc.poll()
+              if (_check_proc is not None and not running) else None)
+
+    if not CHECK_LOG.exists():
+        return JSONResponse({"content": "", "offset": 0,
+                              "running": running, "pid": pid, "rc": rc})
+
+    try:
+        size = CHECK_LOG.stat().st_size
+    except OSError:
+        return JSONResponse({"content": "", "offset": 0,
+                              "running": running, "pid": pid, "rc": rc})
+
+    if offset < 0:
+        offset = 0
+    if offset >= size:
+        return JSONResponse({"content": "", "offset": size,
+                              "running": running, "pid": pid, "rc": rc})
+
+    try:
+        with open(CHECK_LOG, "rb") as f:
+            f.seek(offset)
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return JSONResponse({"content": "", "offset": offset,
+                              "running": running, "pid": pid, "rc": rc})
+
+    clean = _ANSI_RE.sub("", raw)
+    return JSONResponse({"content": clean, "offset": size,
+                          "running": running, "pid": pid, "rc": rc})
+
+
+# ---------------------------------------------------------------------------
+# WebSocket terminal (opcionalmente dentro de un netns)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/terminal")
+async def ws_terminal(ws: WebSocket) -> None:
+    await ws.accept()
+    room_name = ws.query_params.get("room", "").strip() or None
+    netns = None
+    if room_name:
+        room = manager.get_room(room_name)
+        if room is None:
+            await ws.send_json({"type": "error",
+                                 "msg": f"room '{room_name}' no existe"})
+            await ws.close()
+            return
+        if room.state != "connected":
+            await ws.send_json({"type": "error",
+                                 "msg": f"room '{room_name}' está en estado '{room.state}'"})
+            await ws.close()
+            return
+        netns = room.netns
+
+    session = PTYSession()
+    try:
+        cwd = "/root" if os.geteuid() == 0 else os.path.expanduser("~")
+        session.start(cwd=cwd, netns=netns)
+    except Exception as exc:
+        await ws.send_json({"type": "error", "msg": f"no se pudo arrancar pty: {exc}"})
+        await ws.close()
+        return
+
+    loop = asyncio.get_event_loop()
+    stop = asyncio.Event()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def reader_thread() -> None:
+        while True:
+            data = session.read_blocking(8192, poll_timeout=0.05)
+            if data:
+                loop.call_soon_threadsafe(queue.put_nowait, data)
+                continue
+            try:
+                pid, _ = os.waitpid(session.pid, os.WNOHANG)
+                if pid != 0:
+                    loop.call_soon_threadsafe(queue.put_nowait, b"")
+                    return
+            except (ChildProcessError, OSError):
+                loop.call_soon_threadsafe(queue.put_nowait, b"")
+                return
+            if stop.is_set():
+                return
+
+    threading.Thread(target=reader_thread, daemon=True).start()
+
+    async def from_pty() -> None:
+        while not stop.is_set():
+            try:
+                data = await queue.get()
+            except asyncio.CancelledError:
+                return
+            if not data:
+                stop.set()
+                return
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                stop.set()
+                return
+
+    async def to_pty() -> None:
+        while not stop.is_set():
+            try:
+                msg = await ws.receive()
+            except WebSocketDisconnect:
+                stop.set()
+                return
+            except Exception:
+                stop.set()
+                return
+            if msg.get("type") == "websocket.disconnect":
+                stop.set()
+                return
+            if "text" in msg and msg["text"] is not None:
+                txt = msg["text"]
+                try:
+                    obj = json.loads(txt)
+                    if isinstance(obj, dict) and obj.get("action") == "resize":
+                        session.resize(int(obj.get("rows", 24)),
+                                       int(obj.get("cols", 80)))
+                        continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                session.write(txt.encode("utf-8", errors="replace"))
+            elif "bytes" in msg and msg["bytes"] is not None:
+                session.write(msg["bytes"])
+
+    try:
+        await asyncio.gather(from_pty(), to_pty())
+    finally:
+        session.close()
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# HTML embebido — página principal
+# ---------------------------------------------------------------------------
+
+INDEX_HTML = """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>riffle2.1 — multi-VPN</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: #0f0f23; color: #e0e0e0; margin: 0; padding: 24px;
+         min-height: 100vh; box-sizing: border-box; }
+  h1 { margin: 0 0 16px; color: #f39c12; font-size: 22px; }
+  .panel { background: #16213e; border: 1px solid #333; border-radius: 8px;
+           padding: 16px 20px; margin-bottom: 20px; }
+  .panel h2 { margin: 0 0 12px; color: #3498db; font-size: 15px;
+              font-weight: 500; }
+  input, select { background: #0f0f23; color: #e0e0e0; border: 1px solid #333;
+           padding: 8px 10px; border-radius: 4px; font-size: 14px; }
+  select { min-width: 360px; }
+  input { width: 130px; font-family: Consolas, monospace; }
+  button { background: #3498db; color: white; border: 0; padding: 9px 18px;
+           border-radius: 4px; cursor: pointer; font-size: 14px;
+           font-weight: 500; }
+  button.danger { background: #e74c3c; }
+  button.secondary { background: #555; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  table.rooms { border-collapse: collapse; width: 100%; }
+  table.rooms th, table.rooms td { text-align: left; padding: 10px 12px;
+                                    border-bottom: 1px solid #2a2a40; }
+  table.rooms th { color: #888; font-size: 11px; text-transform: uppercase;
+                   letter-spacing: 1px; font-weight: 500; }
+  table.rooms td { font-size: 14px; }
+  .flag { width: 36px; height: 24px; border-radius: 3px; object-fit: cover;
+          vertical-align: middle; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  .flag-ph { display: inline-block; width: 36px; height: 24px; border-radius: 3px;
+             background: #222; vertical-align: middle; color:#555;
+             text-align: center; font-size: 9px; line-height: 24px; }
+  .state-pill { display: inline-block; padding: 2px 10px; border-radius: 10px;
+                font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .state-creating, .state-connecting, .state-disconnecting {
+    background: #f39c12; color: #000; }
+  .state-connected { background: #2ecc71; color: #000; }
+  .state-error { background: #e74c3c; color: #fff; }
+  .muted { color: #888; font-size: 12px; }
+  .mono { font-family: Consolas, monospace; font-size: 13px; }
+  .host-exit { display: flex; gap: 12px; align-items: center;
+               padding: 8px 12px; background: rgba(0,0,0,0.25);
+               border-radius: 6px; }
+  .dropzone { border: 2px dashed #444; border-radius: 6px;
+              padding: 18px 20px; text-align: center; color: #888;
+              transition: border-color .15s, background .15s; cursor: pointer; }
+  .dropzone:hover, .dropzone.drag { border-color: #3498db;
+                                    background: rgba(52,152,219,0.07);
+                                    color: #ccc; }
+  .upload-status { font-size: 13px; color: #aaa; margin-top: 8px;
+                   font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+  <h1>riffle2.1 — multi-VPN simultáneo</h1>
+
+  <div class="panel">
+    <h2>Nueva room</h2>
+    <div class="controls">
+      <label class="muted">nombre</label>
+      <input id="room-name" placeholder="goku" maxlength="8" pattern="[a-z0-9-]+">
+      <button class="secondary" onclick="rollName()" title="Otro nombre DBZ aleatorio"
+              style="padding:6px 10px;">🎲</button>
+      <label class="muted">vpn</label>
+      <select id="vpn-select"></select>
+      <button id="btn-create" onclick="createRoom()">Conectar</button>
+    </div>
+    <div class="muted" id="vpn-count" style="margin-top:8px;"></div>
+    <div id="create-error" style="display:none;margin-top:8px;color:#e74c3c;
+         font-size:13px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Rooms activas <span class="muted" id="rooms-count"></span></h2>
+    <table class="rooms" id="rooms-table">
+      <thead>
+        <tr><th></th><th>nombre</th><th>estado</th><th>país</th><th>IP</th>
+            <th>uptime</th><th></th></tr>
+      </thead>
+      <tbody id="rooms-tbody">
+        <tr><td colspan="7" class="muted">cargando…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Salida real del host (sin VPN)</h2>
+    <div class="host-exit" id="host-exit">
+      <div class="flag-ph" id="host-flag-ph">…</div>
+      <div>
+        <div id="host-country" class="mono">consultando…</div>
+        <div id="host-ip" class="mono muted">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Añadir .ovpn nuevos</h2>
+    <div class="dropzone" id="dropzone" onclick="document.getElementById('fileinput').click()">
+      Arrastra ficheros <code>.ovpn</code> aquí o haz click para seleccionarlos.
+      Se guardarán en <code>inbox/</code>.
+    </div>
+    <input type="file" id="fileinput" multiple accept=".ovpn" style="display:none">
+    <div class="upload-status" id="upload-status"></div>
+    <div style="margin-top:10px;">
+      <button class="secondary" id="btn-check" onclick="launchCheck()">Comprobar inbox/ ahora</button>
+      <span class="muted" id="check-status" style="margin-left:8px;"></span>
+    </div>
+    <div id="check-log-wrap" style="display:none;margin-top:12px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+        <span style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;">
+          log de validación
+        </span>
+        <span class="muted" id="check-summary" style="font-size:11px;"></span>
+        <span style="flex:1;"></span>
+        <button class="secondary" id="btn-check-log-clear"
+                onclick="hideCheckLog()" style="padding:3px 10px;font-size:11px;">
+          ocultar
+        </button>
+      </div>
+      <pre id="check-log" style="background:#000;color:#ddd;border:1px solid #333;
+           border-radius:4px;padding:10px;margin:0;font-family:Consolas,monospace;
+           font-size:12px;line-height:1.45;max-height:380px;overflow:auto;
+           white-space:pre-wrap;word-break:break-word;"></pre>
+    </div>
+  </div>
+
+<script>
+let vpns = [];
+let currentRooms = [];
+
+// Nombres DBZ válidos para netns (regex [a-z0-9-]{1,8})
+const DBZ_NAMES = [
+  'goku', 'vegeta', 'gohan', 'piccolo', 'krillin', 'trunks', 'bulma',
+  'chichi', 'frieza', 'cell', 'buu', 'raditz', 'nappa', 'kakarot',
+  'yamcha', 'tien', 'dende', 'broly', 'beerus', 'whis', 'jiren', 'hit',
+  'kale', 'goten', 'bardock', 'cooler', 'dabura', 'oolong', 'pilaf',
+  'uub', 'tapion', 'zeno', 'guldo', 'zarbon', 'turles', 'videl', 'pan',
+  'babidi', 'recoome', 'majin', 'gogeta', 'vegito', 'kefla'
+];
+
+function pickRandomName() {
+  const taken = new Set(currentRooms.map(r => r.name));
+  const free = DBZ_NAMES.filter(n => !taken.has(n));
+  const pool = free.length ? free : DBZ_NAMES;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function rollName() {
+  document.getElementById('room-name').value = pickRandomName();
+}
+
+function flagEmoji(cc) {
+  if (!cc) return '⚪';
+  return cc.toUpperCase().replace(/./g, c =>
+    String.fromCodePoint(127397 + c.charCodeAt(0)));
+}
+
+async function loadVpns() {
+  const r = await fetch('/api/vpns');
+  vpns = await r.json();
+  const sel = document.getElementById('vpn-select');
+  sel.innerHTML = '';
+  vpns.sort((a, b) => (a.country || 'ZZ').localeCompare(b.country || 'ZZ') ||
+                       a.name.localeCompare(b.name));
+  for (const v of vpns) {
+    const opt = document.createElement('option');
+    const bwTag = v.bandwidth_mbps > 0 ? ` · ${v.bandwidth_mbps.toFixed(1)} Mbps` : '';
+    const validatedTag = v.validated ? ' ✓' : '';
+    opt.value = v.path;
+    opt.textContent = `${flagEmoji(v.country_code)}  ${v.country || '?'} — ${v.name}${bwTag}${validatedTag}`;
+    sel.appendChild(opt);
+  }
+  document.getElementById('vpn-count').textContent =
+    `${vpns.length} VPN disponibles (${vpns.filter(x => x.validated).length} ya validadas)`;
+}
+
+async function createRoom() {
+  const name = document.getElementById('room-name').value.trim().toLowerCase();
+  const path = document.getElementById('vpn-select').value;
+  const err = document.getElementById('create-error');
+  err.style.display = 'none';
+  if (!name) { err.textContent = 'pon un nombre (a-z0-9-, max 8 chars)';
+               err.style.display = ''; return; }
+  if (!path) { err.textContent = 'elige un .ovpn'; err.style.display = ''; return; }
+
+  document.getElementById('btn-create').disabled = true;
+  try {
+    const r = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, path}),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      err.textContent = d.detail || 'error desconocido';
+      err.style.display = '';
+    } else {
+      // tras éxito, dejar el siguiente nombre DBZ listo
+      await refreshRooms();   // actualizar currentRooms para que el roll evite el recién creado
+      rollName();
+    }
+  } catch (e) {
+    err.textContent = 'error de red: ' + e;
+    err.style.display = '';
+  }
+  document.getElementById('btn-create').disabled = false;
+  refreshRooms();
+}
+
+async function deleteRoom(name) {
+  if (!confirm(`¿Desconectar y borrar la room "${name}"?`)) return;
+  await fetch('/api/rooms/' + encodeURIComponent(name), {method: 'DELETE'});
+  refreshRooms();
+}
+
+function fmtDur(s) {
+  if (!s) return '—';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s % 60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s % 3600)/60) + 'm';
+}
+
+async function refreshRooms() {
+  try {
+    const r = await fetch('/api/rooms');
+    const rooms = await r.json();
+    currentRooms = rooms;   // exposed to pickRandomName
+    const tbody = document.getElementById('rooms-tbody');
+    if (!rooms.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">' +
+        'sin rooms activas — crea una arriba</td></tr>';
+    } else {
+      tbody.innerHTML = rooms.map(rm => {
+        const cc = (rm.country_code || '').toLowerCase();
+        const flag = cc ? `<img class="flag" src="https://flagcdn.com/w80/${cc}.png" alt="${cc}">`
+                        : `<span class="flag-ph">?</span>`;
+        const ipText = rm.ip || (rm.state === 'error' ? '—' : '…');
+        const country = rm.country ? `${rm.country} (${rm.country_code})` : '—';
+        const shellBtn = rm.state === 'connected'
+          ? `<button class="secondary" onclick="window.open('/shell?room=${encodeURIComponent(rm.name)}', '_blank', 'noopener')">SHELL</button>`
+          : `<button class="secondary" disabled>SHELL</button>`;
+        const errLine = rm.error
+          ? `<div class="muted" style="color:#e74c3c;font-size:11px;margin-top:2px;">${rm.error}</div>` : '';
+        return `<tr>
+          <td>${flag}</td>
+          <td class="mono">${rm.name}${errLine}</td>
+          <td><span class="state-pill state-${rm.state}">${rm.state}</span></td>
+          <td>${country}</td>
+          <td class="mono">${ipText}</td>
+          <td>${fmtDur(rm.uptime_s)}</td>
+          <td>${shellBtn} <button class="danger" onclick="deleteRoom('${rm.name}')">✗</button></td>
+        </tr>`;
+      }).join('');
+    }
+    document.getElementById('rooms-count').textContent = rooms.length
+      ? `(${rooms.length})` : '';
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function refreshHostExit() {
+  try {
+    const r = await fetch('/api/realip');
+    const d = await r.json();
+    const ph = document.getElementById('host-flag-ph');
+    if (d.country_code) {
+      const cc = d.country_code.toLowerCase();
+      ph.outerHTML = `<img id="host-flag-ph" class="flag" src="https://flagcdn.com/w80/${cc}.png" alt="${cc}">`;
+    }
+    document.getElementById('host-country').textContent =
+      d.country ? `${d.country} (${d.country_code})` : 'desconocido';
+    document.getElementById('host-ip').textContent = d.ip || '—';
+  } catch (e) {}
+}
+
+loadVpns();
+refreshRooms().then(() => rollName());   // primer nombre DBZ al cargar
+refreshHostExit();
+setInterval(refreshRooms, 3000);
+setInterval(refreshHostExit, 10000);
+
+// -------- Upload de .ovpn --------
+const dropzone = document.getElementById('dropzone');
+const fileinput = document.getElementById('fileinput');
+const uploadStatus = document.getElementById('upload-status');
+
+function _preventDef(e) { e.preventDefault(); e.stopPropagation(); }
+
+// Si el usuario suelta el fichero fuera del dropzone (aunque sea por unos
+// píxeles), por defecto el navegador navega al fichero. Lo prevenimos a
+// nivel de window para que esto no rompa la sesión.
+['dragover', 'drop'].forEach(evt => {
+  window.addEventListener(evt, _preventDef, false);
+});
+
+// Handlers explícitos por evento. Antes había dos listeners separados sobre
+// 'drop' (uno marcaba la clase, otro subía); en algunos navegadores la
+// combinación con stopPropagation provocaba que el segundo no se invocara.
+dropzone.addEventListener('dragenter', (e) => {
+  _preventDef(e);
+  dropzone.classList.add('drag');
+});
+dropzone.addEventListener('dragover', (e) => {
+  _preventDef(e);
+  // dataTransfer.dropEffect debe fijarse en cada dragover, si no algunos
+  // navegadores cambian el cursor a "no permitido" y rechazan el drop.
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  dropzone.classList.add('drag');
+});
+dropzone.addEventListener('dragleave', (e) => {
+  _preventDef(e);
+  dropzone.classList.remove('drag');
+});
+dropzone.addEventListener('drop', (e) => {
+  _preventDef(e);
+  dropzone.classList.remove('drag');
+  const files = (e.dataTransfer && e.dataTransfer.files)
+    ? Array.from(e.dataTransfer.files) : [];
+  if (files.length) uploadFiles(files);
+});
+
+fileinput.addEventListener('change', () => {
+  uploadFiles(Array.from(fileinput.files));
+  fileinput.value = '';
+});
+
+async function uploadFiles(files) {
+  if (!files.length) return;
+  uploadStatus.textContent = `Subiendo ${files.length} fichero(s)…`;
+  const results = [];
+  let okCount = 0;
+  for (const f of files) {
+    if (!f.name.toLowerCase().endsWith('.ovpn')) {
+      results.push(`✗ ${f.name} (no es .ovpn)`);
+      continue;
+    }
+    const fd = new FormData();
+    fd.append('file', f);
+    try {
+      const r = await fetch('/api/upload', {method: 'POST', body: fd});
+      const data = await r.json();
+      if (r.ok) {
+        results.push(`✓ ${data.saved} (${(data.size/1024).toFixed(1)} KB)`);
+        okCount += 1;
+      } else {
+        results.push(`✗ ${f.name}: ${data.detail || 'error'}`);
+      }
+    } catch (e) {
+      results.push(`✗ ${f.name}: ${e}`);
+    }
+  }
+  uploadStatus.innerHTML = results.join('<br>');
+  // Auto-disparar la validación: el usuario ve directamente OK/KO + Mbps por VPN
+  // sin tener que pulsar nada extra. Sólo si subió al menos uno OK y no hay
+  // validación en curso.
+  if (okCount > 0) {
+    uploadStatus.innerHTML +=
+      '<br><span style="color:#3498db;">Lanzando validación automáticamente…</span>';
+    launchCheck();
+  }
+}
+
+// ---- Validación con log en vivo ----------------------------------------
+let checkPoller = null;
+let checkLogOffset = 0;
+let lastVpnRefreshTick = 0;
+
+function hideCheckLog() {
+  document.getElementById('check-log-wrap').style.display = 'none';
+}
+
+function showCheckLog() {
+  document.getElementById('check-log-wrap').style.display = '';
+}
+
+function summarizeLog(text) {
+  // Cuenta OK/KO/AUTH/BAD a partir de las líneas tipo "  [X/Y] OK  …"
+  const re = /\b(OK|KO|AUTH|BAD)\b/g;
+  const counts = {OK: 0, KO: 0, AUTH: 0, BAD: 0};
+  for (const line of text.split('\\n')) {
+    if (!/^\s*\[\s*\d+\/\d+\]/.test(line)) continue;
+    const m = line.match(re);
+    if (m && m.length) counts[m[0]] = (counts[m[0]] || 0) + 1;
+  }
+  const parts = [];
+  if (counts.OK)   parts.push(`${counts.OK} OK`);
+  if (counts.KO)   parts.push(`${counts.KO} KO`);
+  if (counts.AUTH) parts.push(`${counts.AUTH} auth`);
+  if (counts.BAD)  parts.push(`${counts.BAD} bad`);
+  return parts.join(' · ');
+}
+
+function startCheckPoller(pid) {
+  const statusEl = document.getElementById('check-status');
+  const logEl = document.getElementById('check-log');
+  const summaryEl = document.getElementById('check-summary');
+  const btn = document.getElementById('btn-check');
+  if (checkPoller) clearInterval(checkPoller);
+  lastVpnRefreshTick = 0;
+  let tick = 0;
+  const poll = async () => {
+    try {
+      const lr = await fetch('/api/check-log?offset=' + checkLogOffset);
+      const ld = await lr.json();
+      if (ld.content) {
+        logEl.textContent += ld.content;
+        logEl.scrollTop = logEl.scrollHeight;
+        summaryEl.textContent = summarizeLog(logEl.textContent);
+      }
+      checkLogOffset = ld.offset;
+      tick += 1;
+      // refresco del dropdown cada ~6s (cuando el validador va moviendo
+      // ficheros a ok/, queremos verlos aparecer sin esperar al final)
+      if (tick - lastVpnRefreshTick >= 4) {
+        lastVpnRefreshTick = tick;
+        loadVpns();
+      }
+      if (!ld.running) {
+        clearInterval(checkPoller);
+        checkPoller = null;
+        const summary = summarizeLog(logEl.textContent);
+        statusEl.textContent = summary
+          ? `validación completa — ${summary}`
+          : 'validación completa';
+        btn.disabled = false;
+        loadVpns();
+      }
+    } catch (e) {
+      console.error('check-log poll', e);
+    }
+  };
+  poll();   // primer tick inmediato
+  checkPoller = setInterval(poll, 1500);
+}
+
+async function launchCheck() {
+  const btn = document.getElementById('btn-check');
+  const statusEl = document.getElementById('check-status');
+  const logEl = document.getElementById('check-log');
+  const summaryEl = document.getElementById('check-summary');
+  if (checkPoller) {
+    // Ya hay polling activo de una validación en curso — sólo asegurar el panel
+    showCheckLog();
+    return;
+  }
+  btn.disabled = true;
+  showCheckLog();
+  logEl.textContent = '';
+  summaryEl.textContent = '';
+  checkLogOffset = 0;
+  statusEl.textContent = 'lanzando…';
+  try {
+    const r = await fetch('/api/check-inbox', {method: 'POST'});
+    const data = await r.json();
+    if (!r.ok) {
+      // 409 = ya hay un proceso corriendo: nos enganchamos a ese
+      if (r.status === 409) {
+        statusEl.textContent = data.detail || 'ya hay una validación corriendo';
+        startCheckPoller();
+        return;
+      }
+      statusEl.textContent = 'error: ' + (data.detail || 'desconocido');
+      btn.disabled = false;
+      return;
+    }
+    statusEl.textContent = `validando (PID ${data.pid})…`;
+    startCheckPoller(data.pid);
+  } catch (e) {
+    statusEl.textContent = 'error: ' + e;
+    btn.disabled = false;
+  }
+}
+
+// Si al cargar la página ya hay una validación corriendo (p.ej. usuario
+// recargó), reengancharse y mostrar el log donde se quedó.
+async function attachIfRunning() {
+  try {
+    const r = await fetch('/api/check-log?offset=0');
+    const d = await r.json();
+    if (d.running) {
+      showCheckLog();
+      const logEl = document.getElementById('check-log');
+      logEl.textContent = d.content || '';
+      logEl.scrollTop = logEl.scrollHeight;
+      checkLogOffset = d.offset;
+      document.getElementById('check-status').textContent =
+        `validando (PID ${d.pid})…`;
+      document.getElementById('btn-check').disabled = true;
+      startCheckPoller(d.pid);
+    }
+  } catch (e) {}
+}
+attachIfRunning();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# HTML embebido — /shell (full-screen, opcionalmente con ?room=...)
+# ---------------------------------------------------------------------------
+
+SHELL_HTML = """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>riffle2.1 — shell</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #000;
+               font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+               color: #ddd; overflow: hidden; }
+  #topbar { display: flex; align-items: center; gap: 12px;
+            background: #16213e; border-bottom: 1px solid #333;
+            padding: 6px 14px; height: 36px; box-sizing: border-box;
+            font-size: 13px; }
+  #topbar .title { color: #f39c12; font-weight: 600; }
+  #topbar .muted { color: #888; font-size: 12px; }
+  #topbar .pill { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                  font-size: 11px; font-weight: 600; background: #555; color: #ddd; }
+  #topbar .pill.live { background: #2ecc71; color: #000; }
+  #topbar .pill.dead { background: #e74c3c; color: #fff; }
+  #topbar button { background: #555; color: #fff; border: 0; padding: 4px 10px;
+                   border-radius: 4px; font-size: 12px; cursor: pointer; }
+  #real-exit { display: flex; align-items: center; gap: 8px;
+               padding: 2px 10px; border-radius: 14px;
+               background: rgba(255,255,255,0.04); transition: background .3s; }
+  #real-exit.changed { background: rgba(46,204,113,0.28); }
+  #real-flag-img, #real-flag-ph { width: 24px; height: 16px; border-radius: 2px;
+                                  display: block; }
+  #real-flag-img { object-fit: cover; }
+  #real-flag-ph { background: #222; }
+  #real-country { font-weight: 600; color: #f1c40f; font-size: 12px; }
+  #real-ip { font-family: Consolas, monospace; font-size: 11px; color: #aaa; }
+  #real-age { font-size: 10px; color: #666; }
+  #term-host { position: absolute; top: 36px; left: 0; right: 0; bottom: 0;
+               background: #000; padding: 6px; box-sizing: border-box; }
+  #term-host .xterm, #term-host .xterm-viewport, #term-host .xterm-screen {
+    background: #000 !important; height: 100% !important; }
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <span class="title" id="title">riffle2.1 shell</span>
+    <span class="pill" id="pill">conectando…</span>
+    <span class="muted" id="room-label"></span>
+    <span style="flex:1;"></span>
+    <span id="real-exit" title="Salida real (refresco cada 5s)">
+      <span id="real-flag-ph"></span>
+      <span id="real-country">…</span>
+      <span id="real-ip"></span>
+      <span id="real-age"></span>
+    </span>
+    <button onclick="refreshRealExit(true)" title="Forzar consulta">↻ IP</button>
+    <button onclick="reconnectTerm()">Reconectar</button>
+  </div>
+  <div id="term-host"></div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const roomName = params.get('room') || '';
+const realipUrl = roomName
+  ? '/api/rooms/' + encodeURIComponent(roomName) + '/realip'
+  : '/api/realip';
+
+if (roomName) {
+  document.getElementById('title').textContent = 'bash @ ' + roomName;
+  document.getElementById('room-label').textContent = '(netns rfl-' + roomName + ')';
+}
+
+let term, fitAddon, ws;
+
+function setPill(text, cls) {
+  const p = document.getElementById('pill');
+  p.textContent = text;
+  p.className = 'pill ' + (cls || '');
+}
+
+function sendResize() {
+  if (!ws || ws.readyState !== 1 || !term) return;
+  ws.send(JSON.stringify({action: 'resize', rows: term.rows, cols: term.cols}));
+}
+
+function connectTermWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const qs = roomName ? '?room=' + encodeURIComponent(roomName) : '';
+  ws = new WebSocket(proto + '//' + location.host + '/ws/terminal' + qs);
+  ws.binaryType = 'arraybuffer';
+  setPill('conectando…', '');
+  ws.onopen = () => { setPill('en vivo', 'live'); setTimeout(sendResize, 80); };
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(e.data));
+    } else if (typeof e.data === 'string') {
+      try {
+        const obj = JSON.parse(e.data);
+        if (obj.type === 'error') {
+          term.write('\\r\\n\\x1b[31m[error] ' + obj.msg + '\\x1b[0m\\r\\n');
+        }
+      } catch (_) { term.write(e.data); }
+    }
+  };
+  ws.onclose = () => setPill('desconectado', 'dead');
+  ws.onerror = () => setPill('error', 'dead');
+}
+
+function reconnectTerm() {
+  if (ws) try { ws.close(); } catch (_) {}
+  setTimeout(connectTermWs, 200);
+}
+
+function initTerm() {
+  term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'Consolas, "Courier New", monospace',
+    fontSize: 14,
+    theme: { background: '#000', foreground: '#e0e0e0' },
+    scrollback: 10000,
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('term-host'));
+  term.onData((d) => {
+    if (ws && ws.readyState === 1) ws.send(d);
+  });
+  setTimeout(() => { fitAddon.fit(); sendResize(); }, 80);
+  connectTermWs();
+  window.addEventListener('resize', () => {
+    try { fitAddon.fit(); sendResize(); } catch (_) {}
+  });
+  term.focus();
+}
+
+// -------- Salida real (host o netns según ?room) --------
+let lastRealIp = '';
+
+async function refreshRealExit(force) {
+  try {
+    const r = await fetch(realipUrl + (force ? '?force=true' : ''));
+    const d = await r.json();
+    const wrap = document.getElementById('real-exit');
+    const flagPh = document.getElementById('real-flag-ph');
+    const country = document.getElementById('real-country');
+    const ip = document.getElementById('real-ip');
+    const age = document.getElementById('real-age');
+    if (d.country_code) {
+      const cc = d.country_code.toLowerCase();
+      flagPh.outerHTML = `<img id="real-flag-ph" src="https://flagcdn.com/w40/${cc}.png" alt="${cc}" style="width:24px;height:16px;border-radius:2px;object-fit:cover;">`;
+    }
+    country.textContent = d.country_code
+      ? `${d.country_code}` : (d.ip ? '?' : 'sin red');
+    country.title = d.country || '';
+    ip.textContent = d.ip || '—';
+    if (d.age_s !== null && d.age_s !== undefined) {
+      age.textContent = d.cached ? `· ${d.age_s}s` : '· live';
+    } else {
+      age.textContent = '';
+    }
+    if (d.ip && lastRealIp && d.ip !== lastRealIp) {
+      wrap.classList.remove('changed');
+      void wrap.offsetWidth;
+      wrap.classList.add('changed');
+      setTimeout(() => wrap.classList.remove('changed'), 1500);
+    }
+    if (d.ip) lastRealIp = d.ip;
+  } catch (e) {
+    document.getElementById('real-country').textContent = 'err';
+  }
+}
+
+refreshRealExit();
+setInterval(refreshRealExit, 5000);
+initTerm();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _shutdown_handler(signum, frame):
+    print(f"[riflle21] señal {signum} recibida", file=sys.stderr)
+    try:
+        manager.shutdown()
+    finally:
+        sys.exit(0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="riflle21_ui",
+                                description="riffle2.1 — multi-VPN UI")
+    p.add_argument("--cleanup-orphans", action="store_true",
+                   help="Borra todos los netns rfl-* y reglas iptables huérfanas")
+    p.add_argument("--host", default=HOST)
+    p.add_argument("--port", type=int, default=PORT)
+    args = p.parse_args(argv)
+
+    if args.cleanup_orphans:
+        if os.geteuid() != 0:
+            print("--cleanup-orphans requiere root", file=sys.stderr)
+            return 2
+        summary = net.cleanup_orphans()
+        print(f"limpiados: netns={summary['netns']}, veth={summary['veth']}")
+        net.teardown_iptables_chains()
+        return 0
+
+    if os.geteuid() != 0:
+        print("AVISO: no estás como root. La UI funcionará pero crear rooms "
+              "fallará. Relánzalo con: sudo python3 riflle21_ui.py",
+              file=sys.stderr)
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    manager.bootstrap()
+
+    print(f"[riflle21] arrancando en http://{args.host}:{args.port}/")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    except KeyboardInterrupt:
+        print("[riflle21] Ctrl-C recibido", file=sys.stderr)
+    finally:
+        manager.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
