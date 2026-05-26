@@ -23,7 +23,9 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -84,6 +86,9 @@ class Room:
     log_tail: list[str] = field(default_factory=list)
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
     net_torn_down: bool = False   # True una vez se limpió netns/veth/iptables
+    # Encadenamiento VPN-sobre-VPN
+    parent: Optional[str] = None              # nombre del room padre (no netns)
+    children: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         # NO usar dataclasses.asdict: hace deepcopy y subprocess.Popen contiene
@@ -106,6 +111,8 @@ class Room:
             "error": self.error,
             "log_tail": list(self.log_tail),
             "uptime_s": int(time.time() - self.started_at) if self.started_at else 0,
+            "parent": self.parent,
+            "children": list(self.children),
         }
 
 
@@ -147,6 +154,7 @@ class RoomManager:
                 self.destroy_room(n)
             except Exception as exc:
                 print(f"[riflle21] error destruyendo {n}: {exc}", file=sys.stderr)
+        tor_mgr.shutdown_all()
         if os.geteuid() == 0:
             net.teardown_iptables_chains()
             # restaurar ip_forward original sólo si lo modificamos
@@ -165,11 +173,20 @@ class RoomManager:
         with self.lock:
             return self.rooms.get(name)
 
-    def create_room(self, name: str, ovpn_path: Path) -> Room:
+    def create_room(self, name: str, ovpn_path: Path,
+                    parent: Optional[str] = None) -> Room:
         net.validate_name(name)
         with self.lock:
             if name in self.rooms:
                 raise HTTPException(409, f"room '{name}' ya existe")
+            if parent:
+                p = self.rooms.get(parent)
+                if p is None:
+                    raise HTTPException(404, f"parent '{parent}' no existe")
+                if p.state != "connected":
+                    raise HTTPException(409,
+                        f"parent '{parent}' está en estado '{p.state}', "
+                        "solo puedes encadenar sobre rooms conectadas")
             taken = {r.subnet for r in self.rooms.values()}
             subnet, host_ip, ns_ip = net.alloc_subnet(name, taken)
             netns = net.netns_name(name)
@@ -177,8 +194,11 @@ class RoomManager:
             room = Room(name=name, netns=netns, ovpn_path=str(ovpn_path),
                         subnet=subnet, host_ip=host_ip, ns_ip=ns_ip,
                         veth_host=veth_host, veth_ns=veth_ns,
-                        state="creating", started_at=time.time())
+                        state="creating", started_at=time.time(),
+                        parent=parent)
             self.rooms[name] = room
+            if parent:
+                self.rooms[parent].children.append(name)
 
         # Setup de red + arranque openvpn se hace fuera del lock en un hilo.
         threading.Thread(target=self._setup_and_connect, args=(room,),
@@ -198,6 +218,24 @@ class RoomManager:
             # el flag y se salta su teardown. Antes ambos hilos veían False
             # y borraban los mismos recursos, generando "Bad rule" warns.
             room.net_torn_down = True
+            children_snapshot = list(room.children)
+            parent_name = room.parent
+            # Derivamos el netns del nombre (determinista) en vez de leerlo del
+            # dict: así no importa si el parent ya fue destruido en cascada o
+            # por error — el cleanup queda best-effort en ambos casos.
+            parent_netns = net.netns_name(parent_name) if parent_name else None
+
+        # -1. cascada: destruir hijos primero (recursivo, profundidad-primero)
+        for child in children_snapshot:
+            try:
+                self.destroy_room(child)
+            except Exception as exc:
+                print(f"[riflle21] error destruyendo hijo {child} de {name}: {exc}",
+                      file=sys.stderr)
+
+        # 0. matar el tor del room (si lo hay) — antes del netns porque vive
+        # dentro de él
+        tor_mgr.force_release(f"room:{name}")
 
         # 1. matar openvpn (si está vivo)
         if proc is not None:
@@ -208,12 +246,44 @@ class RoomManager:
 
         # 2. teardown net (best-effort) — sólo si no se limpió ya
         if not already_clean:
-            errors = net.destroy_room_netns(room.netns, room.subnet, room.veth_host)
+            errors = net.destroy_room_netns(
+                room.netns, room.subnet, room.veth_host,
+                parent_netns=parent_netns,
+                child_name=name if parent_netns else None,
+            )
             for e in errors:
                 print(f"[riflle21] cleanup warn ({name}): {e}", file=sys.stderr)
 
         with self.lock:
             self.rooms.pop(name, None)
+            # quitar este room de la lista de hijos del parent
+            if parent_name:
+                p = self.rooms.get(parent_name)
+                if p is not None:
+                    try:
+                        p.children.remove(name)
+                    except ValueError:
+                        pass
+
+    def _cascade_kill_children(self, room: Room) -> None:
+        """Llamado cuando un parent cae a error: marca los hijos en error y
+        los destruye."""
+        with self.lock:
+            children_snapshot = list(room.children)
+        for child_name in children_snapshot:
+            child = self.get_room(child_name)
+            if child is None:
+                continue
+            with self.lock:
+                if child.state in ("error", "disconnecting"):
+                    continue
+                child.state = "error"
+                child.error = f"parent '{room.name}' caída"
+            try:
+                self.destroy_room(child_name)
+            except Exception as exc:
+                print(f"[riflle21] cascade-kill {child_name}: {exc}",
+                      file=sys.stderr)
 
     # -- internals --------------------------------------------------------
 
@@ -223,11 +293,18 @@ class RoomManager:
             room.log_tail = room.log_tail[-30:]
 
     def _setup_and_connect(self, room: Room) -> None:
+        # Derivado por nombre — robusto frente a races con destroy del parent.
+        parent_netns: Optional[str] = (
+            net.netns_name(room.parent) if room.parent else None
+        )
+
         # 1. crear netns + veth + NAT
         try:
             net.create_room_netns(room.netns, room.subnet,
                                   room.host_ip, room.ns_ip,
-                                  room.veth_host, room.veth_ns)
+                                  room.veth_host, room.veth_ns,
+                                  parent_netns=parent_netns,
+                                  child_name=room.name if parent_netns else None)
         except net.NetworkError as exc:
             with self.lock:
                 room.state = "error"
@@ -261,6 +338,20 @@ class RoomManager:
         ]
         if force_rg:
             cmd += ["--redirect-gateway", "def1"]
+        if parent_netns:
+            # Doble encapsulado → el MTU del túnel exterior recorta espacio.
+            # 1280 inner + 60 (B) + 60 (A) + 20 (IP) ≈ 1420 B en la red física,
+            # bien por debajo de 1500: el primer TCP grande sobrevive aun si
+            # ICMP-too-big está filtrado en el path.
+            # Los pull-filter blindan los push del server que podrían pisar
+            # nuestros recortes (mismo patrón que ya se usa con block-outside-dns).
+            cmd += [
+                "--tun-mtu", "1280",
+                "--mssfix", "1200",
+                "--pull-filter", "ignore", "tun-mtu",
+                "--pull-filter", "ignore", "mssfix",
+                "--pull-filter", "ignore", "link-mtu",
+            ]
 
         try:
             proc = subprocess.Popen(
@@ -315,10 +406,30 @@ class RoomManager:
             self._cleanup_failed(room)
             return
 
-        # 4. dejar que se asienten rutas, consultar geo dentro del netns
-        time.sleep(2)
-        ip, code, country = net.query_geo_in_ns(room.netns, timeout=8)
+        # 4. dejar que se asienten rutas, consultar geo dentro del netns.
+        # En chained doblamos latencia (~2-4x) y el geo va por TCP/HTTP, así
+        # que damos más aire para no generar falsos negativos.
+        time.sleep(5 if parent_netns else 2)
+        ip, code, country = net.query_geo_in_ns(
+            room.netns, timeout=15 if parent_netns else 8
+        )
         if not ip:
+            # Diagnóstico: si chained, los counters de la cadena del child en
+            # el parent dicen si el MASQUERADE se está disparando o no — sin
+            # esto, el usuario solo ve "geo no responde" y no sabe si es MTU,
+            # routing o NAT.
+            if parent_netns:
+                try:
+                    diag = subprocess.run(
+                        ["ip", "netns", "exec", parent_netns, "iptables",
+                         "-t", "nat", "-nvL", net._child_chain(room.name)],
+                        capture_output=True, text=True, timeout=4,
+                    )
+                    self._push_log(room,
+                        "[diag] iptables -nvL en parent:\n"
+                        + (diag.stdout or diag.stderr or "<sin salida>"))
+                except (subprocess.SubprocessError, OSError) as exc:
+                    self._push_log(room, f"[diag] iptables fallo: {exc}")
             try:
                 riflle2.kill_proc_group(proc)
             except Exception:
@@ -364,6 +475,8 @@ class RoomManager:
                 room.state = "error"
                 room.error = "openvpn salió inesperadamente"
                 room.proc = None
+        # cascada: si esta room tenía hijos encadenados, mueren con ella
+        self._cascade_kill_children(room)
         self._cleanup_failed(room)
 
     def _cleanup_failed(self, room: Room) -> None:
@@ -376,7 +489,12 @@ class RoomManager:
             # Claim inmediato bajo lock para evitar race con destroy_room
             # (ver comentario en destroy_room).
             room.net_torn_down = True
-        errors = net.destroy_room_netns(room.netns, room.subnet, room.veth_host)
+            parent_netns = net.netns_name(room.parent) if room.parent else None
+        errors = net.destroy_room_netns(
+            room.netns, room.subnet, room.veth_host,
+            parent_netns=parent_netns,
+            child_name=room.name if parent_netns else None,
+        )
         for e in errors:
             print(f"[riflle21] cleanup-failed warn ({room.name}): {e}",
                   file=sys.stderr)
@@ -440,6 +558,228 @@ def safe_filename(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tor (procesos por room o globales, con refcount)
+# ---------------------------------------------------------------------------
+
+TOR_RUN_DIR = Path("/run/riffle2-tor")
+GLOBAL_TOR_KEY = "__global__"
+
+
+def _detect_tor_user() -> Optional[str]:
+    """tor se niega a correr como root sin User directive. Buscamos un
+    usuario tor del sistema y le pasamos la DataDirectory en propiedad."""
+    if os.geteuid() != 0:
+        return None
+    import pwd
+    for cand in ("debian-tor", "_tor", "tor"):
+        try:
+            pwd.getpwnam(cand)
+            return cand
+        except KeyError:
+            continue
+    return None
+
+
+_TOR_USER = _detect_tor_user()
+
+
+def _port_is_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+class TorProcess:
+    """Una instancia de `tor` viva: proceso, refcount, log de bootstrap."""
+
+    def __init__(self, key: str, netns: Optional[str]) -> None:
+        self.key = key
+        self.netns = netns
+        self.proc: Optional[subprocess.Popen] = None
+        self.refcount = 0
+        self.bootstrap_lines: list[str] = []
+        self.bootstrap_done = threading.Event()
+        self.dead = threading.Event()
+        self._listeners: list[asyncio.Queue] = []
+        self._lock = threading.Lock()
+        # SocksPort 9050 sirve para todos los room (cada netns tiene su propio
+        # loopback). Para el global usamos 9051 por si el host ya tiene un tor
+        # en 9050 (no chocará en términos de bind: es un netns distinto, pero
+        # así también el cliente sabe dónde apuntar si se reusa host tor).
+        self.socks_port = 9050
+
+    def data_dir(self) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", self.key)
+        return TOR_RUN_DIR / safe
+
+    def _write_torrc(self) -> Path:
+        ddir = self.data_dir()
+        ddir.mkdir(parents=True, exist_ok=True)
+        # tor exige permisos restrictivos en DataDirectory
+        os.chmod(ddir, 0o700)
+        # Si corremos como root, tor se negará a continuar a menos que le
+        # demos un User al que bajar privilegios — y ese user tiene que ser
+        # dueño de la DataDirectory.
+        user_line = ""
+        if _TOR_USER:
+            import pwd
+            pw = pwd.getpwnam(_TOR_USER)
+            try:
+                os.chown(ddir, pw.pw_uid, pw.pw_gid)
+            except OSError:
+                pass
+            user_line = f"User {_TOR_USER}\n"
+        torrc = ddir / "torrc"
+        torrc.write_text(
+            f"SocksPort {self.socks_port}\n"
+            f"DataDirectory {ddir}\n"
+            "Log notice stdout\n"
+            "RunAsDaemon 0\n"
+            "ClientOnly 1\n"
+            "AvoidDiskWrites 1\n"
+            + user_line
+        )
+        return torrc
+
+    def start(self) -> None:
+        # Caso especial: tor global. Si el host ya tiene un tor escuchando
+        # en 127.0.0.1:9050 lo reutilizamos sin levantar otro proceso.
+        if self.netns is None and self.key == GLOBAL_TOR_KEY and _port_is_open("127.0.0.1", 9050):
+            self.bootstrap_lines.append(
+                "[riffle2] reusando tor del host en 127.0.0.1:9050"
+            )
+            self.bootstrap_done.set()
+            return
+        torrc = self._write_torrc()
+        argv: list[str]
+        if self.netns:
+            argv = ["ip", "netns", "exec", self.netns, "tor", "-f", str(torrc)]
+        else:
+            argv = ["tor", "-f", str(torrc)]
+        self.proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+            start_new_session=True,
+        )
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        for raw in self.proc.stdout:
+            line = raw.rstrip("\n")
+            with self._lock:
+                self.bootstrap_lines.append(line)
+                if len(self.bootstrap_lines) > 200:
+                    self.bootstrap_lines = self.bootstrap_lines[-200:]
+                listeners = list(self._listeners)
+            for q in listeners:
+                try:
+                    q.put_nowait(line)
+                except Exception:
+                    pass
+            if "Bootstrapped 100%" in line:
+                self.bootstrap_done.set()
+        self.dead.set()
+        self.bootstrap_done.set()   # desbloquear esperas si tor murió
+        with self._lock:
+            listeners = list(self._listeners)
+        for q in listeners:
+            try:
+                q.put_nowait(None)   # sentinela de fin
+            except Exception:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        with self._lock:
+            # entregar histórico al nuevo subscriptor para que vea lo ya emitido
+            for line in self.bootstrap_lines:
+                q.put_nowait(line)
+            self._listeners.append(q)
+        if self.bootstrap_done.is_set():
+            q.put_nowait("__BOOTSTRAPPED__")
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        with self._lock:
+            try:
+                self._listeners.remove(q)
+            except ValueError:
+                pass
+
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+        except Exception:
+            pass
+        self.proc = None
+        self.dead.set()
+        # limpiar DataDirectory (es ephemeral en /run)
+        try:
+            shutil.rmtree(self.data_dir(), ignore_errors=True)
+        except Exception:
+            pass
+
+
+class TorManager:
+    """Pool de procesos tor con refcount por clave."""
+
+    def __init__(self) -> None:
+        self._tors: dict[str, TorProcess] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str, netns: Optional[str]) -> TorProcess:
+        with self._lock:
+            tp = self._tors.get(key)
+            if tp is None or tp.dead.is_set():
+                tp = TorProcess(key, netns)
+                tp.start()
+                self._tors[key] = tp
+            tp.refcount += 1
+            return tp
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            tp = self._tors.get(key)
+            if tp is None:
+                return
+            tp.refcount -= 1
+            if tp.refcount > 0:
+                return
+            self._tors.pop(key, None)
+        tp.stop()
+
+    def force_release(self, key: str) -> None:
+        """Mata el tor de `key` aunque queden refs (usado al borrar un room)."""
+        with self._lock:
+            tp = self._tors.pop(key, None)
+        if tp is not None:
+            tp.stop()
+
+    def shutdown_all(self) -> None:
+        with self._lock:
+            tors = list(self._tors.values())
+            self._tors.clear()
+        for tp in tors:
+            tp.stop()
+
+
+tor_mgr = TorManager()
+
+
+# ---------------------------------------------------------------------------
 # PTY (con soporte de netns)
 # ---------------------------------------------------------------------------
 
@@ -448,7 +788,8 @@ class PTYSession:
         self.pid: int = -1
         self.fd: int = -1
 
-    def start(self, cwd: str = "/root", netns: Optional[str] = None) -> None:
+    def start(self, cwd: str = "/root", netns: Optional[str] = None,
+              tor: bool = False) -> None:
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["TERM"] = "xterm-256color"
@@ -457,11 +798,11 @@ class PTYSession:
                 os.chdir(cwd)
             except OSError:
                 os.chdir("/")
+            inner = ["torsocks", "bash", "--login"] if tor else ["bash", "--login"]
             if netns:
-                # Lanzar bash dentro del netns
-                os.execvp("ip", ["ip", "netns", "exec", netns, "bash", "--login"])
+                os.execvp("ip", ["ip", "netns", "exec", netns] + inner)
             else:
-                os.execvp("bash", ["bash", "--login"])
+                os.execvp(inner[0], inner)
         self.pid = pid
         self.fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -524,6 +865,7 @@ app = FastAPI(title="riffle2.1 — multi-VPN")
 class RoomBody(BaseModel):
     name: str
     path: str
+    parent: Optional[str] = None   # nombre de un room ya `connected` para encadenar
 
 
 NOCACHE_HEADERS = {
@@ -563,7 +905,7 @@ def api_rooms_create(body: RoomBody) -> JSONResponse:
     if not str(p.resolve()).startswith(str(ROOT.resolve())):
         raise HTTPException(403, "path fuera del proyecto")
     try:
-        room = manager.create_room(body.name, p)
+        room = manager.create_room(body.name, p, parent=body.parent or None)
     except net.NetworkError as exc:
         raise HTTPException(400, str(exc))
     return JSONResponse(room.to_dict())
@@ -763,6 +1105,11 @@ def api_check_log(offset: int = 0) -> JSONResponse:
 async def ws_terminal(ws: WebSocket) -> None:
     await ws.accept()
     room_name = ws.query_params.get("room", "").strip() or None
+    use_tor = ws.query_params.get("tor", "") == "1"
+    global_tor = ws.query_params.get("global_tor", "") == "1"
+    if global_tor:
+        # tor global ignora la room
+        room_name = None
     netns = None
     if room_name:
         room = manager.get_room(room_name)
@@ -778,12 +1125,65 @@ async def ws_terminal(ws: WebSocket) -> None:
             return
         netns = room.netns
 
+    tor_key: Optional[str] = None
+    if global_tor:
+        tor_key = GLOBAL_TOR_KEY
+    elif use_tor and room_name:
+        tor_key = f"room:{room_name}"
+
+    async def send_status(line: str) -> None:
+        try:
+            await ws.send_bytes(("\r\n" + line + "\r\n").encode())
+        except Exception:
+            pass
+
+    tor_proc: Optional[TorProcess] = None
+    if tor_key is not None:
+        try:
+            tor_proc = tor_mgr.acquire(tor_key, netns)
+        except Exception as exc:
+            await ws.send_json({"type": "error",
+                                 "msg": f"no se pudo lanzar tor: {exc}"})
+            await ws.close()
+            return
+        # Stream del bootstrap al cliente. send_bytes para que xterm lo
+        # imprima directamente sin pasar por la rama JSON.
+        await send_status("\x1b[33m[riffle2] iniciando tor… espera al bootstrap 100%\x1b[0m")
+        q = tor_proc.subscribe()
+        try:
+            while True:
+                try:
+                    line = await asyncio.wait_for(q.get(), timeout=90)
+                except asyncio.TimeoutError:
+                    await send_status("\x1b[31m[riffle2] tor tarda demasiado (>90s) — abortando\x1b[0m")
+                    tor_proc.unsubscribe(q)
+                    tor_mgr.release(tor_key)
+                    await ws.close()
+                    return
+                if line is None:
+                    # tor murió antes de bootstrap
+                    await send_status("\x1b[31m[riffle2] tor terminó inesperadamente\x1b[0m")
+                    tor_proc.unsubscribe(q)
+                    tor_mgr.release(tor_key)
+                    await ws.close()
+                    return
+                if line == "__BOOTSTRAPPED__":
+                    break
+                await send_status("\x1b[90m" + line + "\x1b[0m")
+                if "Bootstrapped 100%" in line:
+                    break
+        finally:
+            tor_proc.unsubscribe(q)
+        await send_status("\x1b[32m[riffle2] tor listo — abriendo bash con torsocks\x1b[0m\r\n")
+
     session = PTYSession()
     try:
         cwd = "/root" if os.geteuid() == 0 else os.path.expanduser("~")
-        session.start(cwd=cwd, netns=netns)
+        session.start(cwd=cwd, netns=netns, tor=bool(tor_key))
     except Exception as exc:
         await ws.send_json({"type": "error", "msg": f"no se pudo arrancar pty: {exc}"})
+        if tor_key is not None:
+            tor_mgr.release(tor_key)
         await ws.close()
         return
 
@@ -856,6 +1256,8 @@ async def ws_terminal(ws: WebSocket) -> None:
         await asyncio.gather(from_pty(), to_pty())
     finally:
         session.close()
+        if tor_key is not None:
+            tor_mgr.release(tor_key)
         try:
             await ws.close()
         except Exception:
@@ -928,6 +1330,18 @@ INDEX_HTML = """<!doctype html>
   <h1>riffle2.1 — multi-VPN simultáneo</h1>
 
   <div class="panel">
+    <h2>Shell aislada con Tor (sin VPN)</h2>
+    <div class="controls">
+      <button class="secondary"
+              onclick="window.open('/shell?global_tor=1','_blank','noopener')"
+              title="Abre una bash con torsocks en el namespace por defecto — el tráfico sale por la red Tor del host, sin pasar por ninguna VPN del panel">
+        SHELL+TOR (global)
+      </button>
+      <span class="muted">tor del host · arranca un proceso tor propio si el del sistema no está activo</span>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Nueva room</h2>
     <div class="controls">
       <label class="muted">nombre</label>
@@ -936,6 +1350,10 @@ INDEX_HTML = """<!doctype html>
               style="padding:6px 10px;">🎲</button>
       <label class="muted">vpn</label>
       <select id="vpn-select"></select>
+      <label class="muted" title="Encadena esta room sobre otra conectada (VPN-sobre-VPN). Por defecto sale directo por el host.">salir por</label>
+      <select id="parent-select" title="host = salida directa; o elige un room conectado para encadenar">
+        <option value="">host (directo)</option>
+      </select>
       <button id="btn-create" onclick="createRoom()">Conectar</button>
     </div>
     <div class="muted" id="vpn-count" style="margin-top:8px;"></div>
@@ -1051,6 +1469,7 @@ async function loadVpns() {
 async function createRoom() {
   const name = document.getElementById('room-name').value.trim().toLowerCase();
   const path = document.getElementById('vpn-select').value;
+  const parent = document.getElementById('parent-select').value;
   const err = document.getElementById('create-error');
   err.style.display = 'none';
   if (!name) { err.textContent = 'pon un nombre (a-z0-9-, max 8 chars)';
@@ -1059,10 +1478,12 @@ async function createRoom() {
 
   document.getElementById('btn-create').disabled = true;
   try {
+    const body = {name, path};
+    if (parent) body.parent = parent;
     const r = await fetch('/api/rooms', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name, path}),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
     if (!r.ok) {
@@ -1081,8 +1502,32 @@ async function createRoom() {
   refreshRooms();
 }
 
+function collectDescendants(name, byName) {
+  // BFS sobre rm.children para devolver todos los descendientes (no incluye name)
+  const out = [];
+  const queue = [name];
+  while (queue.length) {
+    const n = queue.shift();
+    const rm = byName[n];
+    if (!rm) continue;
+    for (const c of (rm.children || [])) {
+      if (!out.includes(c)) {
+        out.push(c);
+        queue.push(c);
+      }
+    }
+  }
+  return out;
+}
+
 async function deleteRoom(name) {
-  if (!confirm(`¿Desconectar y borrar la room "${name}"?`)) return;
+  const byName = Object.fromEntries(currentRooms.map(r => [r.name, r]));
+  const descendants = collectDescendants(name, byName);
+  let msg = `¿Desconectar y borrar la room "${name}"?`;
+  if (descendants.length) {
+    msg += `\n\nSe destruirán en cascada también: ${descendants.join(', ')}`;
+  }
+  if (!confirm(msg)) return;
   await fetch('/api/rooms/' + encodeURIComponent(name), {method: 'DELETE'});
   refreshRooms();
 }
@@ -1094,11 +1539,31 @@ function fmtDur(s) {
   return Math.floor(s/3600) + 'h ' + Math.floor((s % 3600)/60) + 'm';
 }
 
+function refreshParentSelect(rooms) {
+  const sel = document.getElementById('parent-select');
+  if (!sel) return;
+  const prev = sel.value;
+  // Limpiar todo menos la opción "host"
+  while (sel.options.length > 1) sel.remove(1);
+  for (const rm of rooms) {
+    if (rm.state !== 'connected') continue;
+    const opt = document.createElement('option');
+    const cc = (rm.country_code || '').toUpperCase();
+    const fe = flagEmoji(rm.country_code);
+    opt.value = rm.name;
+    opt.textContent = `${fe} rfl-${rm.name}${cc ? ' ('+cc+')' : ''}`;
+    sel.appendChild(opt);
+  }
+  // Preservar selección previa si sigue válida
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
 async function refreshRooms() {
   try {
     const r = await fetch('/api/rooms');
     const rooms = await r.json();
     currentRooms = rooms;   // exposed to pickRandomName
+    refreshParentSelect(rooms);
     const tbody = document.getElementById('rooms-tbody');
     if (!rooms.length) {
       tbody.innerHTML = '<tr><td colspan="7" class="muted">' +
@@ -1113,16 +1578,25 @@ async function refreshRooms() {
         const shellBtn = rm.state === 'connected'
           ? `<button class="secondary" onclick="window.open('/shell?room=${encodeURIComponent(rm.name)}', '_blank', 'noopener')">SHELL</button>`
           : `<button class="secondary" disabled>SHELL</button>`;
+        const torBtn = rm.state === 'connected'
+          ? `<button class="secondary" title="bash con torsocks dentro del netns del room (tor → VPN)" onclick="window.open('/shell?room=${encodeURIComponent(rm.name)}&tor=1', '_blank', 'noopener')">SHELL+TOR</button>`
+          : `<button class="secondary" disabled>SHELL+TOR</button>`;
         const errLine = rm.error
           ? `<div class="muted" style="color:#e74c3c;font-size:11px;margin-top:2px;">${rm.error}</div>` : '';
+        const parentChip = rm.parent
+          ? ` <span class="muted" title="Esta room sale por el túnel de rfl-${rm.parent}" style="font-size:11px;color:#9b59b6;">↳ rfl-${rm.parent}</span>`
+          : '';
+        const childrenChip = (rm.children && rm.children.length)
+          ? ` <span class="muted" title="Rooms encadenadas sobre esta" style="font-size:11px;color:#16a085;">↳[${rm.children.length}]</span>`
+          : '';
         return `<tr>
           <td>${flag}</td>
-          <td class="mono">${rm.name}${errLine}</td>
+          <td class="mono">${rm.name}${parentChip}${childrenChip}${errLine}</td>
           <td><span class="state-pill state-${rm.state}">${rm.state}</span></td>
           <td>${country}</td>
           <td class="mono">${ipText}</td>
           <td>${fmtDur(rm.uptime_s)}</td>
-          <td>${shellBtn} <button class="danger" onclick="deleteRoom('${rm.name}')">✗</button></td>
+          <td>${shellBtn} ${torBtn} <button class="danger" onclick="deleteRoom('${rm.name}')">✗</button></td>
         </tr>`;
       }).join('');
     }
@@ -1438,11 +1912,21 @@ SHELL_HTML = """<!doctype html>
 <script>
 const params = new URLSearchParams(location.search);
 const roomName = params.get('room') || '';
-const realipUrl = roomName
+const useTor = params.get('tor') === '1';
+const useGlobalTor = params.get('global_tor') === '1';
+const realipUrl = (roomName && !useGlobalTor)
   ? '/api/rooms/' + encodeURIComponent(roomName) + '/realip'
   : '/api/realip';
 
-if (roomName) {
+if (useGlobalTor) {
+  document.title = 'riffle2.1 — shell · tor global';
+  document.getElementById('title').textContent = 'bash · tor (sin VPN)';
+  document.getElementById('room-label').textContent = '(namespace por defecto)';
+} else if (roomName && useTor) {
+  document.title = 'riffle2.1 — shell · tor · ' + roomName;
+  document.getElementById('title').textContent = 'bash · tor @ ' + roomName;
+  document.getElementById('room-label').textContent = '(netns rfl-' + roomName + ' + tor)';
+} else if (roomName) {
   document.getElementById('title').textContent = 'bash @ ' + roomName;
   document.getElementById('room-label').textContent = '(netns rfl-' + roomName + ')';
 }
@@ -1462,7 +1946,11 @@ function sendResize() {
 
 function connectTermWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const qs = roomName ? '?room=' + encodeURIComponent(roomName) : '';
+  const qsParts = [];
+  if (roomName && !useGlobalTor) qsParts.push('room=' + encodeURIComponent(roomName));
+  if (useTor && !useGlobalTor) qsParts.push('tor=1');
+  if (useGlobalTor) qsParts.push('global_tor=1');
+  const qs = qsParts.length ? ('?' + qsParts.join('&')) : '';
   ws = new WebSocket(proto + '//' + location.host + '/ws/terminal' + qs);
   ws.binaryType = 'arraybuffer';
   setPill('conectando…', '');

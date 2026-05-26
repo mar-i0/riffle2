@@ -26,6 +26,9 @@ VETH_HOST_SUFFIX = "-h"
 VETH_NS_SUFFIX = "-n"
 RIFFLE21_NAT = "RIFFLE21-NAT"
 RIFFLE21_FWD = "RIFFLE21-FWD"
+# Cadena per-child instalada DENTRO del netns parent cuando un room está
+# encadenado. El cleanup borra esta cadena entera y queda atómico.
+RIFFLE21_CHILD_PREFIX = "RIFFLE21-C-"   # iptables limita a 28 chars: corto
 SUBNET_POOL_BASE = "10.201"      # /16 partido en /30 → 16384 rooms posibles
 
 IP_FORWARD_PATH = "/proc/sys/net/ipv4/ip_forward"
@@ -183,13 +186,34 @@ def teardown_iptables_chains() -> None:
 # Room netns lifecycle
 # ---------------------------------------------------------------------------
 
+def _child_chain(name: str) -> str:
+    """Nombre de la cadena per-child dentro del netns parent."""
+    return f"{RIFFLE21_CHILD_PREFIX}{name}"
+
+
 def create_room_netns(netns: str, subnet: str, host_ip: str, ns_ip: str,
                        veth_host: str, veth_ns: str,
-                       resolv_conf: str = DEFAULT_RESOLVCONF) -> None:
+                       resolv_conf: str = DEFAULT_RESOLVCONF,
+                       parent_netns: str | None = None,
+                       child_name: str | None = None) -> None:
     """Crea netns + veth + IPs + ruta default + NAT + DNS. Si algo falla,
-    intenta limpiar lo que haya quedado a medias antes de relanzar."""
+    intenta limpiar lo que haya quedado a medias antes de relanzar.
+
+    Si ``parent_netns`` se especifica, la red del room se enlaza al netns del
+    parent en vez de al host: el extremo veth-host se mete dentro del parent,
+    el NAT/FORWARD se aplica con iptables del parent (cadena per-child), y
+    el handshake/tráfico del room sale por el tun0 del parent. Esto permite
+    encadenar VPNs (VPN-sobre-VPN).
+    """
+    chained = parent_netns is not None
+    if chained and not child_name:
+        raise NetworkError("create_room_netns: child_name requerido con parent_netns")
+    chain_name = _child_chain(child_name) if chained else ""
+
     created = {"netns": False, "resolv": False, "veth": False,
-               "nat": False, "fwd_in": False, "fwd_out": False}
+               "veth_in_parent": False,
+               "nat": False, "fwd_in": False, "fwd_out": False,
+               "child_chain": False, "child_jump": False}
     try:
         # 1. netns
         _run(["ip", "netns", "add", netns])
@@ -202,17 +226,26 @@ def create_room_netns(netns: str, subnet: str, host_ip: str, ns_ip: str,
             f.write(resolv_conf)
         created["resolv"] = True
 
-        # 3. veth pair
+        # 3. veth pair (los dos extremos nacen en default ns)
         _run(["ip", "link", "add", veth_host, "type", "veth",
               "peer", "name", veth_ns])
         created["veth"] = True
 
-        # 4. mover el peer al netns
+        # 4. mover el peer al netns del room
         _run(["ip", "link", "set", veth_ns, "netns", netns])
 
         # 5. lado host: ip + up
-        _run(["ip", "addr", "add", f"{host_ip}/30", "dev", veth_host])
-        _run(["ip", "link", "set", veth_host, "up"])
+        if chained:
+            # mover veth-host al netns del parent
+            _run(["ip", "link", "set", veth_host, "netns", parent_netns])
+            created["veth_in_parent"] = True
+            _run(["ip", "netns", "exec", parent_netns,
+                  "ip", "addr", "add", f"{host_ip}/30", "dev", veth_host])
+            _run(["ip", "netns", "exec", parent_netns,
+                  "ip", "link", "set", veth_host, "up"])
+        else:
+            _run(["ip", "addr", "add", f"{host_ip}/30", "dev", veth_host])
+            _run(["ip", "link", "set", veth_host, "up"])
 
         # 6. dentro del netns: lo + veth + ruta default
         _run(["ip", "netns", "exec", netns, "ip", "link", "set", "lo", "up"])
@@ -222,25 +255,76 @@ def create_room_netns(netns: str, subnet: str, host_ip: str, ns_ip: str,
         _run(["ip", "netns", "exec", netns, "ip", "route", "add",
               "default", "via", host_ip])
 
-        # 7. NAT + FORWARD
-        _run(["iptables", "-t", "nat", "-A", RIFFLE21_NAT,
-              "-s", subnet, "-j", "MASQUERADE"])
-        created["nat"] = True
-        _run(["iptables", "-A", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
-        created["fwd_in"] = True
-        _run(["iptables", "-A", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
-        created["fwd_out"] = True
+        # 7. NAT + FORWARD — host o parent según corresponda
+        if chained:
+            # ip_forward dentro del parent (idempotente)
+            _try(["ip", "netns", "exec", parent_netns,
+                  "sysctl", "-w", "net.ipv4.ip_forward=1"])
+            # rp_filter loose en el parent: con doble encapsulado, los paquetes
+            # encriptados del hijo (src = ns_ip_B) entran por veth y se reenvían
+            # a tun0 — con rp_filter=1 (strict) el kernel los puede dropear si
+            # la verificación reverse-path no le cuadra. Loose=2 es lo que usa
+            # Docker/k8s en escenarios equivalentes.
+            _try(["ip", "netns", "exec", parent_netns,
+                  "sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
+            _try(["ip", "netns", "exec", parent_netns,
+                  "sysctl", "-w", f"net.ipv4.conf.{veth_host}.rp_filter=2"])
+            # cadena per-child (cleanup atómico borrándola entera)
+            _run(["ip", "netns", "exec", parent_netns,
+                  "iptables", "-t", "nat", "-N", chain_name])
+            created["child_chain"] = True
+            _run(["ip", "netns", "exec", parent_netns,
+                  "iptables", "-t", "nat", "-A", chain_name,
+                  "-s", subnet, "-o", "tun0", "-j", "MASQUERADE"])
+            _run(["ip", "netns", "exec", parent_netns,
+                  "iptables", "-t", "nat", "-A", "POSTROUTING",
+                  "-j", chain_name])
+            created["child_jump"] = True
+            _run(["ip", "netns", "exec", parent_netns,
+                  "iptables", "-A", "FORWARD", "-i", veth_host, "-j", "ACCEPT"])
+            created["fwd_in"] = True
+            _run(["ip", "netns", "exec", parent_netns,
+                  "iptables", "-A", "FORWARD", "-o", veth_host, "-j", "ACCEPT"])
+            created["fwd_out"] = True
+        else:
+            _run(["iptables", "-t", "nat", "-A", RIFFLE21_NAT,
+                  "-s", subnet, "-j", "MASQUERADE"])
+            created["nat"] = True
+            _run(["iptables", "-A", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
+            created["fwd_in"] = True
+            _run(["iptables", "-A", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
+            created["fwd_out"] = True
 
     except NetworkError:
         # rollback parcial best-effort
-        if created["fwd_out"]:
-            _try(["iptables", "-D", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
-        if created["fwd_in"]:
-            _try(["iptables", "-D", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
-        if created["nat"]:
-            _try(["iptables", "-t", "nat", "-D", RIFFLE21_NAT,
-                  "-s", subnet, "-j", "MASQUERADE"])
-        if created["veth"]:
+        if chained:
+            if created["fwd_out"]:
+                _try(["ip", "netns", "exec", parent_netns,
+                      "iptables", "-D", "FORWARD", "-o", veth_host, "-j", "ACCEPT"])
+            if created["fwd_in"]:
+                _try(["ip", "netns", "exec", parent_netns,
+                      "iptables", "-D", "FORWARD", "-i", veth_host, "-j", "ACCEPT"])
+            if created["child_jump"]:
+                _try(["ip", "netns", "exec", parent_netns,
+                      "iptables", "-t", "nat", "-D", "POSTROUTING",
+                      "-j", chain_name])
+            if created["child_chain"]:
+                _try(["ip", "netns", "exec", parent_netns,
+                      "iptables", "-t", "nat", "-F", chain_name])
+                _try(["ip", "netns", "exec", parent_netns,
+                      "iptables", "-t", "nat", "-X", chain_name])
+            if created["veth_in_parent"]:
+                _try(["ip", "netns", "exec", parent_netns,
+                      "ip", "link", "del", veth_host])
+        else:
+            if created["fwd_out"]:
+                _try(["iptables", "-D", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
+            if created["fwd_in"]:
+                _try(["iptables", "-D", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
+            if created["nat"]:
+                _try(["iptables", "-t", "nat", "-D", RIFFLE21_NAT,
+                      "-s", subnet, "-j", "MASQUERADE"])
+        if created["veth"] and not created["veth_in_parent"]:
             _try(["ip", "link", "del", veth_host])
         if created["netns"]:
             _try(["ip", "netns", "del", netns])
@@ -250,23 +334,47 @@ def create_room_netns(netns: str, subnet: str, host_ip: str, ns_ip: str,
 
 
 def destroy_room_netns(netns: str, subnet: str,
-                        veth_host: str) -> list[str]:
-    """Tear down completo. Devuelve la lista de errores ignorados (para log)."""
-    errors: list[str] = []
+                        veth_host: str,
+                        parent_netns: str | None = None,
+                        child_name: str | None = None) -> list[str]:
+    """Tear down completo. Devuelve la lista de errores ignorados (para log).
 
-    def step(cmd: list[str]) -> None:
+    Para rooms encadenadas (parent_netns!=None), limpia las reglas y la veth
+    desde dentro del netns del parent. Si el parent ya fue destruido en
+    cascada, los `ip netns exec <parent>` fallarán silenciosamente — es
+    intencional: el netns destruido se llevó por delante todo lo de dentro.
+    """
+    errors: list[str] = []
+    chained = parent_netns is not None
+
+    def step(cmd: list[str], best_effort: bool = False) -> None:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=8.0)
-        if r.returncode != 0:
+        if r.returncode != 0 and not best_effort:
             err = (r.stderr or r.stdout or "").strip()
             errors.append(f"{' '.join(cmd)} → {err}")
 
-    # 1. iptables
-    step(["iptables", "-D", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
-    step(["iptables", "-D", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
-    step(["iptables", "-t", "nat", "-D", RIFFLE21_NAT, "-s", subnet, "-j", "MASQUERADE"])
-
-    # 2. veth (lado peer dentro del netns se borra al borrar el host)
-    step(["ip", "link", "del", veth_host])
+    if chained:
+        chain_name = _child_chain(child_name or "")
+        prefix = ["ip", "netns", "exec", parent_netns]
+        # 1. iptables del parent (best-effort: el parent puede haber muerto)
+        step(prefix + ["iptables", "-D", "FORWARD", "-o", veth_host, "-j", "ACCEPT"],
+             best_effort=True)
+        step(prefix + ["iptables", "-D", "FORWARD", "-i", veth_host, "-j", "ACCEPT"],
+             best_effort=True)
+        step(prefix + ["iptables", "-t", "nat", "-D", "POSTROUTING",
+                       "-j", chain_name], best_effort=True)
+        step(prefix + ["iptables", "-t", "nat", "-F", chain_name], best_effort=True)
+        step(prefix + ["iptables", "-t", "nat", "-X", chain_name], best_effort=True)
+        # 2. veth-host vive dentro del parent
+        step(prefix + ["ip", "link", "del", veth_host], best_effort=True)
+    else:
+        # 1. iptables del host
+        step(["iptables", "-D", RIFFLE21_FWD, "-o", veth_host, "-j", "ACCEPT"])
+        step(["iptables", "-D", RIFFLE21_FWD, "-i", veth_host, "-j", "ACCEPT"])
+        step(["iptables", "-t", "nat", "-D", RIFFLE21_NAT,
+              "-s", subnet, "-j", "MASQUERADE"])
+        # 2. veth (lado peer dentro del netns se borra al borrar el host)
+        step(["ip", "link", "del", veth_host])
 
     # 3. netns — esto mata los procesos que sigan dentro (openvpn, bash...)
     step(["ip", "netns", "del", netns])
