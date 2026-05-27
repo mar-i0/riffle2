@@ -32,6 +32,7 @@ import sys
 import termios
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -46,11 +47,32 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import riflle2          # type: ignore
 import riflle21_net as net   # type: ignore
+import riflle21_backends as backends  # type: ignore
+import riflle21_uri as proxyuri   # type: ignore
 
 ROOT = Path(__file__).resolve().parent
 OK_DIR = ROOT / "ok"
 INBOX = ROOT / "inbox"
+# Carpeta donde se persisten las URIs validadas (vless/vmess/trojan/hy2).
+# Antes se llamaba "vless_ok" — migración automática en _migrate_legacy_dirs().
+PROXIES_OK_DIR = ROOT / "proxies_ok"
+PROXIES_TRASH = ROOT / "proxies_trash"
+VLESS_INBOX = ROOT / "vless_inbox"
 CACHE_FILE = ROOT / ".riflle2_cache.json"
+
+
+def _migrate_legacy_dirs() -> None:
+    """Renombra carpetas de versiones anteriores (sólo gestionaban .vless).
+    Idempotente: no hace nada si la destino ya existe o la origen no."""
+    legacy_ok = ROOT / "vless_ok"
+    if legacy_ok.exists() and not PROXIES_OK_DIR.exists():
+        legacy_ok.rename(PROXIES_OK_DIR)
+    legacy_trash = ROOT / "vless_trash"
+    if legacy_trash.exists() and not PROXIES_TRASH.exists():
+        legacy_trash.rename(PROXIES_TRASH)
+
+
+_migrate_legacy_dirs()
 HOST = os.environ.get("RIFLLE21_HOST", "0.0.0.0")
 PORT = int(os.environ.get("RIFLLE21_PORT", "8061"))
 
@@ -71,12 +93,13 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 class Room:
     name: str
     netns: str
-    ovpn_path: str
+    ovpn_path: str                            # path del .ovpn O .vless (nombre legacy)
     subnet: str
     host_ip: str
     ns_ip: str
     veth_host: str
     veth_ns: str
+    kind: str = "ovpn"                         # "ovpn" | "vless"
     state: str = "creating"   # creating | connecting | connected | error | disconnecting
     ip: str = ""
     country_code: str = ""
@@ -86,6 +109,9 @@ class Room:
     log_tail: list[str] = field(default_factory=list)
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
     net_torn_down: bool = False   # True una vez se limpió netns/veth/iptables
+    # Ficheros temporales generados por el backend (p. ej. .json de xray);
+    # se borran al destruir el room.
+    tmp_paths: list[str] = field(default_factory=list)
     # Encadenamiento VPN-sobre-VPN
     parent: Optional[str] = None              # nombre del room padre (no netns)
     children: list[str] = field(default_factory=list)
@@ -98,6 +124,7 @@ class Room:
             "name": self.name,
             "netns": self.netns,
             "ovpn_path": self.ovpn_path,
+            "kind": self.kind,
             "subnet": self.subnet,
             "host_ip": self.host_ip,
             "ns_ip": self.ns_ip,
@@ -176,6 +203,10 @@ class RoomManager:
     def create_room(self, name: str, ovpn_path: Path,
                     parent: Optional[str] = None) -> Room:
         net.validate_name(name)
+        try:
+            kind = backends.detect_kind(ovpn_path)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         with self.lock:
             if name in self.rooms:
                 raise HTTPException(409, f"room '{name}' ya existe")
@@ -192,6 +223,7 @@ class RoomManager:
             netns = net.netns_name(name)
             veth_host, veth_ns = net.veth_names(name)
             room = Room(name=name, netns=netns, ovpn_path=str(ovpn_path),
+                        kind=kind,
                         subnet=subnet, host_ip=host_ip, ns_ip=ns_ip,
                         veth_host=veth_host, veth_ns=veth_ns,
                         state="creating", started_at=time.time(),
@@ -254,6 +286,13 @@ class RoomManager:
             for e in errors:
                 print(f"[riflle21] cleanup warn ({name}): {e}", file=sys.stderr)
 
+        # 3. borrar ficheros temporales del backend (p. ej. .json de xray)
+        for tp in list(room.tmp_paths):
+            try:
+                os.unlink(tp)
+            except OSError:
+                pass
+
         with self.lock:
             self.rooms.pop(name, None)
             # quitar este room de la lista de hijos del parent
@@ -314,48 +353,24 @@ class RoomManager:
         with self.lock:
             room.state = "connecting"
 
-        # 2. preparar comando openvpn dentro del netns
+        # 2. construir el comando del backend (openvpn o xray)
         try:
-            text = Path(room.ovpn_path).read_text(errors="replace")
-        except OSError as exc:
+            spec = backends.build_backend(
+                room.netns, Path(room.ovpn_path), chained=bool(parent_netns),
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
             with self.lock:
                 room.state = "error"
-                room.error = f"leer ovpn: {exc}"
+                room.error = f"backend {room.kind}: {exc}"
+            self._cleanup_failed(room)
             return
-        force_rg = not (riflle2.has_redirect_gateway(text)
-                        or riflle2.PATCH_MARKER in text)
 
-        cmd = [
-            "ip", "netns", "exec", room.netns,
-            riflle2.OPENVPN_BIN,
-            "--config", room.ovpn_path,
-            "--dev", "tun0",
-            "--connect-timeout", "10",
-            "--connect-retry", "0",
-            "--resolv-retry", "0",
-            "--pull-filter", "ignore", "block-outside-dns",
-            "--verb", "3",
-        ]
-        if force_rg:
-            cmd += ["--redirect-gateway", "def1"]
-        if parent_netns:
-            # Doble encapsulado → el MTU del túnel exterior recorta espacio.
-            # 1280 inner + 60 (B) + 60 (A) + 20 (IP) ≈ 1420 B en la red física,
-            # bien por debajo de 1500: el primer TCP grande sobrevive aun si
-            # ICMP-too-big está filtrado en el path.
-            # Los pull-filter blindan los push del server que podrían pisar
-            # nuestros recortes (mismo patrón que ya se usa con block-outside-dns).
-            cmd += [
-                "--tun-mtu", "1280",
-                "--mssfix", "1200",
-                "--pull-filter", "ignore", "tun-mtu",
-                "--pull-filter", "ignore", "mssfix",
-                "--pull-filter", "ignore", "link-mtu",
-            ]
+        with self.lock:
+            room.tmp_paths = [str(p) for p in spec.cleanup_paths]
 
         try:
             proc = subprocess.Popen(
-                cmd,
+                spec.cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -365,34 +380,65 @@ class RoomManager:
         except OSError as exc:
             with self.lock:
                 room.state = "error"
-                room.error = f"openvpn spawn: {exc}"
+                room.error = f"{spec.kind} spawn: {exc}"
             self._cleanup_failed(room)
             return
 
         with self.lock:
             room.proc = proc
 
-        # 3. esperar handshake
-        start = time.monotonic()
+        # 3. esperar handshake — la estrategia depende del backend
         ok = False
         dead_reason = ""
-        while time.monotonic() - start < CONNECT_TIMEOUT_S:
-            assert proc.stdout is not None
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
+
+        vless_drain_started = False
+        if spec.kind == "vless":
+            # xray no expone un marker estable. Estrategia: spawnear el drain
+            # "definitivo" ya (_drain_log captura log_tail + reacciona si el
+            # proceso muere); el main thread polleará tun0 dentro del netns.
+            # Importante: un único lector de stdout (si hubiera dos, se
+            # repartirían las líneas y se vería log corrupto).
+            threading.Thread(target=self._drain_log, args=(room, proc),
+                             daemon=True).start()
+            vless_drain_started = True
+
+            tun_ok, tun_err = backends.wait_for_tun_in_ns(
+                room.netns, timeout=CONNECT_TIMEOUT_S, proc=proc,
+            )
+            if not tun_ok:
+                dead_reason = tun_err
+            else:
+                routes_ok, routes_info = backends.install_vless_routes(
+                    room.netns, room.host_ip, spec.vless_server_host,
+                )
+                self._push_log(room, f"[routes] {routes_info}")
+                if not routes_ok:
+                    dead_reason = f"install_vless_routes: {routes_info}"
+                else:
+                    ok = True
+        else:
+            # OpenVPN: leer stdout esperando OK_MARKER o un DEAD_MARKER.
+            start = time.monotonic()
+            while time.monotonic() - start < CONNECT_TIMEOUT_S:
+                assert proc.stdout is not None
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                self._push_log(room, line)
+                if spec.ok_marker and spec.ok_marker in line:
+                    ok = True
                     break
-                continue
-            self._push_log(room, line)
-            if riflle2.OK_MARKER in line:
-                ok = True
-                break
-            for m in riflle2.DEAD_MARKERS:
-                if m in line:
-                    dead_reason = m
+                if spec.ok_marker_alt and spec.ok_marker_alt in line:
+                    ok = True
                     break
-            if dead_reason:
-                break
+                for m in spec.dead_markers:
+                    if m in line:
+                        dead_reason = m
+                        break
+                if dead_reason:
+                    break
 
         if not ok:
             try:
@@ -406,10 +452,9 @@ class RoomManager:
             self._cleanup_failed(room)
             return
 
-        # 4. dejar que se asienten rutas, consultar geo dentro del netns.
-        # En chained doblamos latencia (~2-4x) y el geo va por TCP/HTTP, así
-        # que damos más aire para no generar falsos negativos.
-        time.sleep(5 if parent_netns else 2)
+        # 4. dejar que se asienten rutas (xray instala tun0+ruta default al
+        # arrancar; openvpn igual). Doblamos espera en chained.
+        time.sleep(spec.settle_seconds + (3.0 if parent_netns else 0.0))
         ip, code, country = net.query_geo_in_ns(
             room.netns, timeout=15 if parent_netns else 8
         )
@@ -430,6 +475,22 @@ class RoomManager:
                         + (diag.stdout or diag.stderr or "<sin salida>"))
                 except (subprocess.SubprocessError, OSError) as exc:
                     self._push_log(room, f"[diag] iptables fallo: {exc}")
+            # Diagnóstico VLESS: rutas + estado del tun + ping al server.
+            # El log_tail del room ya tiene la salida de xray (lo más útil
+            # para saber si la negociación VLESS está fallando), pero
+            # añadimos lo de red para que esté todo junto.
+            if spec.kind == "vless":
+                for cmd, tag in [
+                    (["ip", "netns", "exec", room.netns, "ip", "route"], "ip route"),
+                    (["ip", "netns", "exec", room.netns, "ip", "-br", "addr"], "ip addr"),
+                    (["ip", "netns", "exec", room.netns, "ss", "-tn", "state", "established"], "ss"),
+                ]:
+                    try:
+                        d = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+                        self._push_log(room, f"[diag] {tag}:\n"
+                                       + (d.stdout or d.stderr or "<vacío>"))
+                    except (subprocess.SubprocessError, OSError) as exc:
+                        self._push_log(room, f"[diag] {tag} fallo: {exc}")
             try:
                 riflle2.kill_proc_group(proc)
             except Exception:
@@ -453,9 +514,11 @@ class RoomManager:
             self._cleanup_failed(room)
             return
 
-        # 5. todo OK; drenar log en background
-        threading.Thread(target=self._drain_log, args=(room, proc),
-                         daemon=True).start()
+        # 5. todo OK; drenar log en background (para VLESS ya está corriendo
+        # desde el paso 3 — evitamos duplicar el reader sobre el mismo stdout)
+        if not vless_drain_started:
+            threading.Thread(target=self._drain_log, args=(room, proc),
+                             daemon=True).start()
 
         with self.lock:
             room.state = "connected"
@@ -473,7 +536,7 @@ class RoomManager:
         with self.lock:
             if room.proc is proc and room.state == "connected":
                 room.state = "error"
-                room.error = "openvpn salió inesperadamente"
+                room.error = "el proceso del túnel salió inesperadamente"
                 room.proc = None
         # cascada: si esta room tenía hijos encadenados, mueren con ella
         self._cascade_kill_children(room)
@@ -498,6 +561,12 @@ class RoomManager:
         for e in errors:
             print(f"[riflle21] cleanup-failed warn ({room.name}): {e}",
                   file=sys.stderr)
+        # ficheros tmp del backend (config xray, etc.)
+        for tp in list(room.tmp_paths):
+            try:
+                os.unlink(tp)
+            except OSError:
+                pass
 
 
 manager = RoomManager()
@@ -519,9 +588,9 @@ def _check_running() -> bool:
 # ---------------------------------------------------------------------------
 
 def list_vpns() -> list[dict]:
-    """Sólo lista ficheros .ovpn ya validados (en ok/). Los de inbox/ no aparecen
-    en el dropdown hasta que pasen el check — así el usuario no puede seleccionar
-    una VPN rota."""
+    """Lista túneles disponibles: .ovpn de ok/ y .vless/.vmess/.trojan/.hy2
+    de proxies_ok/. Sólo los validados aparecen — el dropdown no debe ofrecer
+    rotos."""
     cache: dict = {}
     if CACHE_FILE.exists():
         try:
@@ -535,6 +604,7 @@ def list_vpns() -> list[dict]:
                 digest = riflle2.sha1_of(p)
                 c = cache.get(digest, {})
                 entries.append({
+                    "kind": "ovpn",
                     "name": p.name,
                     "path": str(p),
                     "source": "ok",
@@ -543,26 +613,46 @@ def list_vpns() -> list[dict]:
                     "bandwidth_mbps": float(c.get("bandwidth_mbps") or 0.0),
                     "validated": c.get("status") == "ok",
                 })
+    if PROXIES_OK_DIR.exists():
+        for p in sorted(PROXIES_OK_DIR.iterdir()):
+            if not p.is_file():
+                continue
+            kind = proxyuri.kind_from_path(p)
+            if kind is None:
+                continue
+            digest = riflle2.sha1_of(p)
+            c = cache.get(digest, {})
+            entries.append({
+                "kind": kind,
+                "name": p.name,
+                "path": str(p),
+                "source": "proxies_ok",
+                "country_code": (c.get("country_code") or "").lower(),
+                "country": c.get("country") or "",
+                "bandwidth_mbps": float(c.get("bandwidth_mbps") or 0.0),
+                # Si no hay cache, asumimos validado por estar en proxies_ok/.
+                "validated": c.get("status", "ok") == "ok",
+            })
     return entries
 
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._一-鿿-]+")
 
 
-def safe_filename(name: str) -> str:
+def safe_filename(name: str, default_ext: str = ".ovpn") -> str:
     base = Path(name).name
     base = SAFE_NAME_RE.sub("_", base)
-    if not base.endswith(".ovpn"):
-        base += ".ovpn"
+    lower = base.lower()
+    if not (lower.endswith(".ovpn") or lower.endswith(".vless")):
+        base += default_ext
     return base[:200]
 
 
 # ---------------------------------------------------------------------------
-# Tor (procesos por room o globales, con refcount)
+# Tor (procesos por room, con refcount)
 # ---------------------------------------------------------------------------
 
 TOR_RUN_DIR = Path("/run/riffle2-tor")
-GLOBAL_TOR_KEY = "__global__"
 
 
 def _detect_tor_user() -> Optional[str]:
@@ -581,14 +671,6 @@ def _detect_tor_user() -> Optional[str]:
 
 
 _TOR_USER = _detect_tor_user()
-
-
-def _port_is_open(host: str, port: int, timeout: float = 0.3) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 class TorProcess:
@@ -644,14 +726,6 @@ class TorProcess:
         return torrc
 
     def start(self) -> None:
-        # Caso especial: tor global. Si el host ya tiene un tor escuchando
-        # en 127.0.0.1:9050 lo reutilizamos sin levantar otro proceso.
-        if self.netns is None and self.key == GLOBAL_TOR_KEY and _port_is_open("127.0.0.1", 9050):
-            self.bootstrap_lines.append(
-                "[riffle2] reusando tor del host en 127.0.0.1:9050"
-            )
-            self.bootstrap_done.set()
-            return
         torrc = self._write_torrc()
         argv: list[str]
         if self.netns:
@@ -890,6 +964,57 @@ def api_vpns() -> JSONResponse:
     return JSONResponse(list_vpns())
 
 
+@app.delete("/api/tunnels")
+def api_tunnels_delete(path: str) -> JSONResponse:
+    """Mueve un túnel (.ovpn de ok/ o cualquier .vless/.vmess/.trojan/.hy2 de
+    proxies_ok/) a su papelera correspondiente (`trash/` u `proxies_trash/`).
+    No borra destructivamente — por si te arrepientes."""
+    p = Path(path)
+    try:
+        resolved = p.resolve()
+    except OSError as exc:
+        raise HTTPException(400, f"path inválido: {exc}")
+    root_resolved = ROOT.resolve()
+    if not str(resolved).startswith(str(root_resolved)):
+        raise HTTPException(403, "path fuera del proyecto")
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404, "fichero no encontrado")
+    suf = p.suffix.lower()
+    if suf == ".ovpn":
+        dest_dir = ROOT / "trash"
+        cache_kind = "ovpn"
+    elif proxyuri.kind_from_path(p) is not None:
+        dest_dir = PROXIES_TRASH
+        cache_kind = proxyuri.kind_from_path(p)
+    else:
+        raise HTTPException(400,
+            "extensiones soportadas: .ovpn / .vless / .vmess / .trojan / .hy2")
+    dest_dir.mkdir(exist_ok=True)
+    target = dest_dir / p.name
+    n = 1
+    while target.exists():
+        target = dest_dir / f"{p.stem}.dup{n}{suf}"
+        n += 1
+    # Invalida la entrada del cache (si la había) — el digest cambia con la
+    # ubicación pero el contenido es igual; mejor: borramos por sha1 actual.
+    try:
+        digest = riflle2.sha1_of(p)
+    except OSError:
+        digest = ""
+    p.rename(target)
+    if digest:
+        try:
+            with _CACHE_LOCK:
+                cache = riflle2.load_cache()
+                if digest in cache:
+                    cache.pop(digest, None)
+                    riflle2.save_cache(cache)
+        except (OSError, ValueError):
+            pass
+    return JSONResponse({"ok": True, "moved_to": str(target),
+                          "kind": cache_kind})
+
+
 @app.get("/api/rooms")
 def api_rooms_list() -> JSONResponse:
     return JSONResponse(manager.snapshot())
@@ -900,8 +1025,12 @@ def api_rooms_create(body: RoomBody) -> JSONResponse:
     if os.geteuid() != 0:
         raise HTTPException(503, "el servidor no está como root; ip netns falla")
     p = Path(body.path)
-    if not p.exists() or p.suffix != ".ovpn":
-        raise HTTPException(400, "fichero no encontrado o no es .ovpn")
+    valid_ext = (p.suffix.lower() == ".ovpn"
+                 or proxyuri.kind_from_path(p) is not None)
+    if not p.exists() or not valid_ext:
+        raise HTTPException(400,
+            "fichero no encontrado o extensión no soportada "
+            "(.ovpn / .vless / .vmess / .trojan / .hy2)")
     if not str(p.resolve()).startswith(str(ROOT.resolve())):
         raise HTTPException(403, "path fuera del proyecto")
     try:
@@ -987,20 +1116,27 @@ def api_realip_host(force: bool = False) -> JSONResponse:
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)) -> JSONResponse:
-    if not (file.filename or "").lower().endswith(".ovpn"):
-        raise HTTPException(400, "el fichero debe tener extensión .ovpn")
-    INBOX.mkdir(exist_ok=True)
-    safe = safe_filename(file.filename)
-    target = INBOX / safe
+    fname = (file.filename or "").lower()
+    if fname.endswith(".ovpn"):
+        kind, dest_dir, ext = "ovpn", INBOX, ".ovpn"
+    elif fname.endswith(".vless"):
+        kind, dest_dir, ext = "vless", VLESS_INBOX, ".vless"
+    else:
+        raise HTTPException(400, "extensión soportada: .ovpn o .vless")
+    dest_dir.mkdir(exist_ok=True)
+    safe = safe_filename(file.filename, default_ext=ext)
+    target = dest_dir / safe
     n = 1
     while target.exists():
-        target = INBOX / f"{safe[:-5]}.dup{n}.ovpn"
+        stem = safe[:-len(ext)]
+        target = dest_dir / f"{stem}.dup{n}{ext}"
         n += 1
     data = await file.read()
     if len(data) > 2_000_000:
         raise HTTPException(413, "fichero demasiado grande (>2MB)")
     target.write_bytes(data)
-    return JSONResponse({"ok": True, "saved": target.name, "size": len(data)})
+    return JSONResponse({"ok": True, "saved": target.name, "size": len(data),
+                         "kind": kind})
 
 
 @app.post("/api/check-inbox")
@@ -1044,6 +1180,219 @@ def api_check_inbox(bandwidth: bool = True, timeout: int = 10) -> JSONResponse:
             cmd.append("--bandwidth")
         cmd.append("check")
         # 'w' trunca el fichero — empezamos limpios cada run.
+        _check_log_fh = open(CHECK_LOG, "w")
+        _check_proc = subprocess.Popen(
+            cmd,
+            stdout=_check_log_fh,
+            stderr=subprocess.STDOUT,
+            cwd=str(ROOT),
+            start_new_session=True,
+        )
+        pid = _check_proc.pid
+    return JSONResponse({"ok": True, "pid": pid, "log": str(CHECK_LOG),
+                          "cmd": " ".join(cmd)})
+
+
+class ProxyUrisBody(BaseModel):
+    uris: list[str]
+    # Timeout aplica POR curl interno (geo / bandwidth). El total de cada URI
+    # es del orden de 50-60s: wait_tun (~15) + settle + geo1 + estabilidad
+    # (15) + geo2 + bw + teardown.
+    timeout: float = 12.0
+
+
+@app.post("/api/check-proxy-uris")
+def api_check_proxy_uris(body: ProxyUrisBody) -> JSONResponse:
+    """Valida una lista de URIs (vless/vmess/trojan/hysteria2) pegadas en la
+    UI. Para cada una se reproduce el flujo exacto de una sala (netns efímero
+    + TUN + rutas split + geo + estabilidad 15s) — si la prueba pasa, la URI
+    conecta de verdad al crear el room. Las que pasan se guardan en
+    proxies_ok/ con la extensión propia del protocolo (.vless/.vmess/.trojan/
+    .hy2) y aparecen en el desplegable.
+
+    Es lento (~50 s por URI con 4 workers concurrentes) pero garantiza que lo
+    añadido funciona. Cap de 50 URIs por request."""
+    uris = [u.strip() for u in body.uris
+            if u.strip() and not u.strip().startswith("#")]
+    if not uris:
+        raise HTTPException(400, "lista vacía")
+    if len(uris) > 50:
+        raise HTTPException(400,
+            f"máximo 50 URIs por request, recibidas {len(uris)}")
+    # timeout aplica por curl (geo/bw). Total por URI ≈ 50-60 s.
+    timeout = max(4.0, min(float(body.timeout), 20.0))
+
+    PROXIES_OK_DIR.mkdir(exist_ok=True)
+    existing = _existing_proxy_uris()
+    existing_lock = threading.Lock()
+
+    # Snapshot de subnets ya ocupadas por rooms vivos + lock para reservar
+    # subnets entre workers concurrentes del propio deep test. Sin esto, dos
+    # smokes pueden chocar al pedir la misma /30 a alloc_subnet.
+    with manager.lock:
+        in_use_subnets: set[str] = {r.subnet for r in manager.rooms.values()}
+    subnets_lock = threading.Lock()
+    baseline_ip = manager.baseline_ip
+
+    def _check_one(uri: str) -> dict:
+        entry: dict = {"uri": uri, "status": "malformed", "reason": "",
+                       "saved_as": None, "target": "", "tag": "",
+                       "kind": "",
+                       "ip": "", "country_code": "", "bandwidth_mbps": 0.0}
+        with existing_lock:
+            if uri in existing:
+                entry["status"] = "duplicated"
+                entry["reason"] = "ya estaba en proxies_ok/"
+                return entry
+        # Pre-parseo para clasificar malformadas sin reservar netns.
+        try:
+            p = proxyuri.parse(uri)
+        except (ValueError, RuntimeError) as exc:
+            entry["status"] = "malformed"
+            entry["reason"] = f"parse: {exc}"
+            return entry
+        entry["target"] = f"{p.host}:{p.port}"
+        entry["tag"] = p.tag
+        entry["kind"] = p.kind
+
+        # Deep smoke test: el caller pasa el snapshot de subnets vivas para
+        # que alloc_subnet evite colisión con salas y con otros workers.
+        with subnets_lock:
+            taken_now = frozenset(in_use_subnets)
+        try:
+            sok, sreason, _skind, sip, scc, sbw = backends.deep_smoke_test_uri(
+                uri, timeout=timeout,
+                taken_subnets=taken_now, baseline_ip=baseline_ip,
+            )
+        except Exception as exc:
+            sok, sreason, sip, scc, sbw = (
+                False, f"excepción: {exc}", "", "", 0.0)
+        if not sok:
+            # La fase la lleva el propio reason ("wait_tun:", "routes:",
+            # "geo1:", "stability:", etc.). Clasificamos en dead vs auth para
+            # que el dropdown de la UI las separe.
+            entry["status"] = "dead" if sreason.startswith(
+                ("wait_tun:", "routes:", "geo1:", "stability:")
+            ) else "auth"
+            entry["reason"] = sreason
+            return entry
+        # ¡pasa todo!
+        entry["status"] = "ok"
+        entry["ip"] = sip
+        entry["country_code"] = scc
+        entry["bandwidth_mbps"] = sbw
+        with existing_lock:
+            if uri in existing:   # carrera con otro worker que guardó la misma
+                entry["status"] = "duplicated"
+                entry["reason"] = "ya estaba en proxies_ok/"
+                return entry
+            entry["saved_as"] = _save_proxy_uri(
+                uri, p.kind, p.tag, f"{p.host}:{p.port}",
+                ip=sip, country_code=scc, bandwidth_mbps=sbw,
+            )
+            existing.add(uri)
+        return entry
+
+    # 4 workers: cada deep test arranca un xray con TUN inbound + crea netns
+    # + monta veth/NAT. 4 simultáneos van bien en máquinas modestas; subir más
+    # introduce ruido sensible en la medición de bandwidth de cada uno.
+    n_workers = min(4, len(uris))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        results = list(ex.map(_check_one, uris))
+
+    summary = {"ok": 0, "auth": 0, "dead": 0, "malformed": 0, "duplicated": 0}
+    for r in results:
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+    return JSONResponse({"results": results, "summary": summary})
+
+
+def _existing_proxy_uris() -> set[str]:
+    """Set de URIs (vless/vmess/trojan/hy2) ya guardadas en proxies_ok/.
+    Cada fichero tiene una URI canónica como primera línea no-comentario."""
+    out: set[str] = set()
+    if not PROXIES_OK_DIR.exists():
+        return out
+    for p in PROXIES_OK_DIR.iterdir():
+        if not p.is_file() or proxyuri.kind_from_path(p) is None:
+            continue
+        try:
+            for line in p.read_text(errors="replace").splitlines():
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    out.add(s)
+                    break
+        except OSError:
+            continue
+    return out
+
+
+_CACHE_LOCK = threading.Lock()
+
+
+def _save_proxy_uri(uri: str, kind: str, tag: str, target: str,
+                    ip: str = "", country_code: str = "",
+                    bandwidth_mbps: float = 0.0) -> str:
+    """Persiste una URI validada en proxies_ok/ con la extensión propia del
+    protocolo (`.vless`/`.vmess`/`.trojan`/`.hy2`) y actualiza el cache
+    (sha1→info) para que el desplegable muestre banderita, país y Mbps sin
+    tener que reconectar."""
+    ext = proxyuri.KIND_TO_EXT.get(kind, ".vless")
+    base = (tag or target or kind).strip()
+    base = SAFE_NAME_RE.sub("_", base)[:80] or kind
+    target_path = PROXIES_OK_DIR / f"{base}{ext}"
+    n = 1
+    while target_path.exists():
+        target_path = PROXIES_OK_DIR / f"{base}.dup{n}{ext}"
+        n += 1
+    target_path.write_text(
+        f"# guardado desde la UI ({tag or target})\n{uri}\n",
+        encoding="utf-8",
+    )
+    # Cache: clave = sha1 del fichero (mismo formato que usa list_vpns).
+    if ip or country_code or bandwidth_mbps:
+        try:
+            digest = riflle2.sha1_of(target_path)
+            with _CACHE_LOCK:
+                cache = riflle2.load_cache()
+                cache[digest] = {
+                    "status": "ok",
+                    "reason": "deep smoke ok",
+                    "external_ip": ip,
+                    "country_code": (country_code or "").upper(),
+                    "country": "",
+                    "patched": False,
+                    "bandwidth_mbps": float(bandwidth_mbps),
+                    "ts": int(time.time()),
+                    "kind": kind,
+                }
+                riflle2.save_cache(cache)
+        except (OSError, ValueError):
+            pass   # cache es best-effort, no bloquea el guardado
+    return target_path.name
+
+
+@app.post("/api/check-vless-inbox")
+def api_check_vless_inbox(timeout: int = 8) -> JSONResponse:
+    """Lanza `riflle2.py vless-check` en background contra ./vless_inbox/.
+    Comparte CHECK_LOG y _check_proc con la validación .ovpn (solo una a la vez).
+    No requiere root (vless-check sólo hace handshake DNS/TCP/TLS/WS)."""
+    global _check_proc, _check_log_fh
+    timeout = max(3, min(int(timeout), 60))
+    with _check_lock:
+        if _check_proc is not None and _check_proc.poll() is None:
+            raise HTTPException(
+                409, f"ya hay una validación corriendo (PID {_check_proc.pid})"
+            )
+        if _check_log_fh is not None:
+            try:
+                _check_log_fh.close()
+            except OSError:
+                pass
+            _check_log_fh = None
+
+        script = ROOT / "riflle2.py"
+        cmd = ["python3", "-u", str(script),
+               "--timeout", str(timeout), "vless-check"]
         _check_log_fh = open(CHECK_LOG, "w")
         _check_proc = subprocess.Popen(
             cmd,
@@ -1106,10 +1455,6 @@ async def ws_terminal(ws: WebSocket) -> None:
     await ws.accept()
     room_name = ws.query_params.get("room", "").strip() or None
     use_tor = ws.query_params.get("tor", "") == "1"
-    global_tor = ws.query_params.get("global_tor", "") == "1"
-    if global_tor:
-        # tor global ignora la room
-        room_name = None
     netns = None
     if room_name:
         room = manager.get_room(room_name)
@@ -1126,9 +1471,7 @@ async def ws_terminal(ws: WebSocket) -> None:
         netns = room.netns
 
     tor_key: Optional[str] = None
-    if global_tor:
-        tor_key = GLOBAL_TOR_KEY
-    elif use_tor and room_name:
+    if use_tor and room_name:
         tor_key = f"room:{room_name}"
 
     async def send_status(line: str) -> None:
@@ -1330,18 +1673,6 @@ INDEX_HTML = """<!doctype html>
   <h1>riffle2.1 — multi-VPN simultáneo</h1>
 
   <div class="panel">
-    <h2>Shell aislada con Tor (sin VPN)</h2>
-    <div class="controls">
-      <button class="secondary"
-              onclick="window.open('/shell?global_tor=1','_blank','noopener')"
-              title="Abre una bash con torsocks en el namespace por defecto — el tráfico sale por la red Tor del host, sin pasar por ninguna VPN del panel">
-        SHELL+TOR (global)
-      </button>
-      <span class="muted">tor del host · arranca un proceso tor propio si el del sistema no está activo</span>
-    </div>
-  </div>
-
-  <div class="panel">
     <h2>Nueva room</h2>
     <div class="controls">
       <label class="muted">nombre</label>
@@ -1355,6 +1686,10 @@ INDEX_HTML = """<!doctype html>
         <option value="">host (directo)</option>
       </select>
       <button id="btn-create" onclick="createRoom()">Conectar</button>
+      <button class="danger" id="btn-delete-tunnel"
+              onclick="deleteSelectedTunnel()"
+              title="Mueve el túnel seleccionado a trash/ o vless_trash/"
+              style="padding:9px 12px;">🗑</button>
     </div>
     <div class="muted" id="vpn-count" style="margin-top:8px;"></div>
     <div id="create-error" style="display:none;margin-top:8px;color:#e74c3c;
@@ -1386,15 +1721,19 @@ INDEX_HTML = """<!doctype html>
   </div>
 
   <div class="panel">
-    <h2>Añadir .ovpn nuevos</h2>
+    <h2>Añadir túneles nuevos (.ovpn / .vless)</h2>
     <div class="dropzone" id="dropzone" onclick="document.getElementById('fileinput').click()">
-      Arrastra ficheros <code>.ovpn</code> aquí o haz click para seleccionarlos.
-      Se guardarán en <code>inbox/</code>.
+      Arrastra ficheros <code>.ovpn</code> o <code>.vless</code> aquí o haz click para seleccionarlos.
+      Los <code>.ovpn</code> van a <code>inbox/</code>; los <code>.vless</code> a <code>vless_inbox/</code>.
     </div>
-    <input type="file" id="fileinput" multiple accept=".ovpn" style="display:none">
+    <input type="file" id="fileinput" multiple accept=".ovpn,.vless" style="display:none">
     <div class="upload-status" id="upload-status"></div>
     <div style="margin-top:10px;">
       <button class="secondary" id="btn-check" onclick="launchCheck()">Comprobar inbox/ ahora</button>
+      <button class="secondary" id="btn-check-vless" onclick="launchVlessCheck()"
+              title="Valida los .vless de vless_inbox/ (DNS+TCP+TLS+WS)">
+        Comprobar vless_inbox/ ahora
+      </button>
       <span class="muted" id="check-status" style="margin-left:8px;"></span>
     </div>
     <div id="check-log-wrap" style="display:none;margin-top:12px;">
@@ -1414,6 +1753,33 @@ INDEX_HTML = """<!doctype html>
            font-size:12px;line-height:1.45;max-height:380px;overflow:auto;
            white-space:pre-wrap;word-break:break-word;"></pre>
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>Pegar URIs vless/hysteria2/vmess/trojan y validar</h2>
+    <div class="muted" style="margin-bottom:8px;">
+      Una URI por línea (<code>vless://</code>, <code>hysteria2://</code>,
+      <code>vmess://</code> o <code>trojan://</code>; las que empiecen por
+      <code>#</code> se ignoran). Cada URI se levanta como una sala real
+      (netns + TUN + rutas + geo + estabilidad 15&nbsp;s) — lo que pase el
+      chequeo conecta de verdad al crearle el room. Tarda ~50&nbsp;s por URI
+      con 4 en paralelo (5 URIs ≈ 1 min, 20 URIs ≈ 4 min). hysteria2 usa
+      sing-box; el resto, xray.
+    </div>
+    <textarea id="proxy-uris-input" rows="6"
+              placeholder="vless://uuid@host:port?security=tls&type=ws&...#tag&#10;hysteria2://password@host:port?sni=...#tag&#10;vmess://<base64>&#10;trojan://password@host:port?security=tls&sni=...#tag"
+              style="width:100%;box-sizing:border-box;background:#0f0f23;color:#e0e0e0;
+                     border:1px solid #333;border-radius:4px;padding:8px 10px;
+                     font-family:Consolas,monospace;font-size:12px;
+                     resize:vertical;"></textarea>
+    <div class="controls" style="margin-top:8px;">
+      <button id="btn-validate-uris" onclick="validateProxyUris()">
+        Validar a fondo y guardar OK
+      </button>
+      <span class="muted" id="proxy-uris-status"></span>
+    </div>
+    <div id="proxy-uris-results" style="margin-top:10px;font-size:12px;
+         font-family:Consolas,monospace;"></div>
   </div>
 
 <script>
@@ -1458,12 +1824,16 @@ async function loadVpns() {
     const opt = document.createElement('option');
     const bwTag = v.bandwidth_mbps > 0 ? ` · ${v.bandwidth_mbps.toFixed(1)} Mbps` : '';
     const validatedTag = v.validated ? ' ✓' : '';
+    const kindTag = (v.kind || 'ovpn').toUpperCase();
     opt.value = v.path;
-    opt.textContent = `${flagEmoji(v.country_code)}  ${v.country || '?'} — ${v.name}${bwTag}${validatedTag}`;
+    opt.textContent = `[${kindTag}] ${flagEmoji(v.country_code)}  ${v.country || '?'} — ${v.name}${bwTag}${validatedTag}`;
     sel.appendChild(opt);
   }
+  const nVless = vpns.filter(x => x.kind === 'vless').length;
+  const nOvpn  = vpns.filter(x => x.kind !== 'vless').length;
   document.getElementById('vpn-count').textContent =
-    `${vpns.length} VPN disponibles (${vpns.filter(x => x.validated).length} ya validadas)`;
+    `${vpns.length} túneles disponibles · ${nOvpn} OVPN · ${nVless} VLESS ` +
+    `(${vpns.filter(x => x.validated).length} validados)`;
 }
 
 async function createRoom() {
@@ -1500,6 +1870,35 @@ async function createRoom() {
   }
   document.getElementById('btn-create').disabled = false;
   refreshRooms();
+}
+
+async function deleteSelectedTunnel() {
+  const sel = document.getElementById('vpn-select');
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.value) {
+    alert('no hay túnel seleccionado');
+    return;
+  }
+  const path = opt.value;
+  const label = opt.textContent;
+  if (!confirm(`¿Mover a trash/ este túnel?\\n\\n${label}\\n${path}`)) {
+    return;
+  }
+  const btn = document.getElementById('btn-delete-tunnel');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/tunnels?path=' + encodeURIComponent(path),
+                          {method: 'DELETE'});
+    const data = await r.json();
+    if (!r.ok) {
+      alert('error: ' + (data.detail || 'desconocido'));
+    } else {
+      await loadVpns();
+    }
+  } catch (e) {
+    alert('error de red: ' + e);
+  }
+  btn.disabled = false;
 }
 
 function collectDescendants(name, byName) {
@@ -1586,12 +1985,15 @@ async function refreshRooms() {
         const parentChip = rm.parent
           ? ` <span class="muted" title="Esta room sale por el túnel de rfl-${rm.parent}" style="font-size:11px;color:#9b59b6;">↳ rfl-${rm.parent}</span>`
           : '';
+        const kindChip = rm.kind === 'vless'
+          ? ` <span title="Túnel VLESS (xray)" style="font-size:10px;padding:1px 6px;border-radius:8px;background:#8e44ad;color:#fff;font-weight:600;">VLESS</span>`
+          : ` <span title="Túnel OpenVPN" style="font-size:10px;padding:1px 6px;border-radius:8px;background:#2980b9;color:#fff;font-weight:600;">OVPN</span>`;
         const childrenChip = (rm.children && rm.children.length)
           ? ` <span class="muted" title="Rooms encadenadas sobre esta" style="font-size:11px;color:#16a085;">↳[${rm.children.length}]</span>`
           : '';
         return `<tr>
           <td>${flag}</td>
-          <td class="mono">${rm.name}${parentChip}${childrenChip}${errLine}</td>
+          <td class="mono">${rm.name}${kindChip}${parentChip}${childrenChip}${errLine}</td>
           <td><span class="state-pill state-${rm.state}">${rm.state}</span></td>
           <td>${country}</td>
           <td class="mono">${ipText}</td>
@@ -1677,10 +2079,11 @@ async function uploadFiles(files) {
   if (!files.length) return;
   uploadStatus.textContent = `Subiendo ${files.length} fichero(s)…`;
   const results = [];
-  let okCount = 0;
+  let okOvpn = 0, okVless = 0;
   for (const f of files) {
-    if (!f.name.toLowerCase().endsWith('.ovpn')) {
-      results.push(`✗ ${f.name} (no es .ovpn)`);
+    const lf = f.name.toLowerCase();
+    if (!(lf.endsWith('.ovpn') || lf.endsWith('.vless'))) {
+      results.push(`✗ ${f.name} (no es .ovpn / .vless)`);
       continue;
     }
     const fd = new FormData();
@@ -1690,7 +2093,7 @@ async function uploadFiles(files) {
       const data = await r.json();
       if (r.ok) {
         results.push(`✓ ${data.saved} (${(data.size/1024).toFixed(1)} KB)`);
-        okCount += 1;
+        if (data.kind === 'vless') okVless += 1; else okOvpn += 1;
       } else {
         results.push(`✗ ${f.name}: ${data.detail || 'error'}`);
       }
@@ -1699,13 +2102,19 @@ async function uploadFiles(files) {
     }
   }
   uploadStatus.innerHTML = results.join('<br>');
-  // Auto-disparar la validación: el usuario ve directamente OK/KO + Mbps por VPN
-  // sin tener que pulsar nada extra. Sólo si subió al menos uno OK y no hay
-  // validación en curso.
-  if (okCount > 0) {
+  // Auto-disparar la validación adecuada. Si hay ambos tipos, primero VLESS
+  // (no requiere root y tarda segundos) y luego dejamos OpenVPN al usuario —
+  // o también lo lanzamos en cadena cuando termine. Para mantenerlo simple,
+  // priorizamos OpenVPN (más lento) y dejamos VLESS como segundo botón si
+  // hace falta.
+  if (okOvpn > 0) {
     uploadStatus.innerHTML +=
-      '<br><span style="color:#3498db;">Lanzando validación automáticamente…</span>';
+      '<br><span style="color:#3498db;">Lanzando validación OpenVPN…</span>';
     launchCheck();
+  } else if (okVless > 0) {
+    uploadStatus.innerHTML +=
+      '<br><span style="color:#8e44ad;">Lanzando validación VLESS…</span>';
+    launchVlessCheck();
   }
 }
 
@@ -1744,6 +2153,7 @@ function startCheckPoller(pid) {
   const logEl = document.getElementById('check-log');
   const summaryEl = document.getElementById('check-summary');
   const btn = document.getElementById('btn-check');
+  const btnVless = document.getElementById('btn-check-vless');
   if (checkPoller) clearInterval(checkPoller);
   lastVpnRefreshTick = 0;
   let tick = 0;
@@ -1772,6 +2182,7 @@ function startCheckPoller(pid) {
           ? `validación completa — ${summary}`
           : 'validación completa';
         btn.disabled = false;
+        if (btnVless) btnVless.disabled = false;
         loadVpns();
       }
     } catch (e) {
@@ -1813,6 +2224,117 @@ async function launchCheck() {
       return;
     }
     statusEl.textContent = `validando (PID ${data.pid})…`;
+    startCheckPoller(data.pid);
+  } catch (e) {
+    statusEl.textContent = 'error: ' + e;
+    btn.disabled = false;
+  }
+}
+
+async function validateProxyUris() {
+  const ta = document.getElementById('proxy-uris-input');
+  const btn = document.getElementById('btn-validate-uris');
+  const statusEl = document.getElementById('proxy-uris-status');
+  const resultsEl = document.getElementById('proxy-uris-results');
+  const uris = ta.value.split('\\n').map(s => s.trim())
+                 .filter(s => s && !s.startsWith('#'));
+  if (!uris.length) {
+    statusEl.textContent = 'pega al menos una URI (vless/hysteria2/vmess/trojan)';
+    return;
+  }
+  btn.disabled = true;
+  // 4 workers, ~50s por URI ⇒ ceil(n/4)*50s ± solapamiento.
+  const etaSec = Math.ceil(uris.length / 4) * 50;
+  const etaTxt = etaSec >= 60
+    ? `~${Math.round(etaSec/60)} min`
+    : `~${etaSec} s`;
+  statusEl.textContent =
+    `validando ${uris.length} URI(s) a fondo (${etaTxt}, no cierres la pestaña)…`;
+  resultsEl.innerHTML = '';
+  try {
+    const r = await fetch('/api/check-proxy-uris', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uris}),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      statusEl.textContent = 'error: ' + (data.detail || 'desconocido');
+      btn.disabled = false;
+      return;
+    }
+    const s = data.summary;
+    const dup = s.duplicated || 0;
+    statusEl.textContent =
+      `${s.ok} OK · ${s.auth} auth · ${s.dead} muertos · ` +
+      `${s.malformed} malformed · ${dup} duplicados`;
+    // Pintar tabla con resultados
+    const rows = data.results.map(res => {
+      const colors = {ok: '#2ecc71', auth: '#f39c12',
+                      dead: '#e74c3c', malformed: '#888',
+                      duplicated: '#7f8c8d'};
+      const c = colors[res.status] || '#888';
+      const kindLabel = res.kind
+        ? ` <span style="color:#9b59b6;font-weight:600;">[${res.kind}]</span>` : '';
+      const tag = res.tag ? ` <span style="color:#aaa;">#${res.tag}</span>` : '';
+      const bw = (res.bandwidth_mbps && res.bandwidth_mbps > 0)
+        ? ` <span style="color:#1abc9c;">· ${res.bandwidth_mbps.toFixed(1)} Mbps</span>` : '';
+      const saved = res.saved_as
+        ? `<span style="color:#3498db;">→ ${res.saved_as}</span>` : '';
+      const reason = res.reason
+        ? `<div style="color:#999;font-size:11px;padding-left:60px;">${res.reason}</div>` : '';
+      const uriTrunc = res.uri.length > 80
+        ? res.uri.slice(0, 77) + '…' : res.uri;
+      return `<div style="padding:3px 0;border-bottom:1px solid #222;">
+        <span style="display:inline-block;width:50px;color:${c};font-weight:600;">
+          ${res.status.toUpperCase()}
+        </span>${kindLabel}
+        <span style="color:#ddd;">${res.target || '?'}</span>${tag}${bw}
+        ${saved}
+        <div style="color:#666;font-size:11px;padding-left:60px;">${uriTrunc}</div>
+        ${reason}
+      </div>`;
+    });
+    resultsEl.innerHTML = rows.join('');
+    // Si guardamos alguna, refrescar el dropdown para que aparezca enseguida
+    if (s.ok > 0) {
+      loadVpns();
+    }
+    // Limpiar el textarea sólo si no quedó nada que retocar (ok+dup contaron
+    // como ya resueltas; auth/dead/malformed implican algo que arreglar).
+    if ((s.auth + s.dead + s.malformed) === 0) ta.value = '';
+  } catch (e) {
+    statusEl.textContent = 'error de red: ' + e;
+  }
+  btn.disabled = false;
+}
+
+async function launchVlessCheck() {
+  const btn = document.getElementById('btn-check-vless');
+  const statusEl = document.getElementById('check-status');
+  const logEl = document.getElementById('check-log');
+  const summaryEl = document.getElementById('check-summary');
+  if (checkPoller) { showCheckLog(); return; }
+  btn.disabled = true;
+  showCheckLog();
+  logEl.textContent = '';
+  summaryEl.textContent = '';
+  checkLogOffset = 0;
+  statusEl.textContent = 'validando VLESS…';
+  try {
+    const r = await fetch('/api/check-vless-inbox', {method: 'POST'});
+    const data = await r.json();
+    if (!r.ok) {
+      if (r.status === 409) {
+        statusEl.textContent = data.detail || 'ya hay una validación corriendo';
+        startCheckPoller();
+        return;
+      }
+      statusEl.textContent = 'error: ' + (data.detail || 'desconocido');
+      btn.disabled = false;
+      return;
+    }
+    statusEl.textContent = `validando VLESS (PID ${data.pid})…`;
     startCheckPoller(data.pid);
   } catch (e) {
     statusEl.textContent = 'error: ' + e;
@@ -1913,16 +2435,11 @@ SHELL_HTML = """<!doctype html>
 const params = new URLSearchParams(location.search);
 const roomName = params.get('room') || '';
 const useTor = params.get('tor') === '1';
-const useGlobalTor = params.get('global_tor') === '1';
-const realipUrl = (roomName && !useGlobalTor)
+const realipUrl = roomName
   ? '/api/rooms/' + encodeURIComponent(roomName) + '/realip'
   : '/api/realip';
 
-if (useGlobalTor) {
-  document.title = 'riffle2.1 — shell · tor global';
-  document.getElementById('title').textContent = 'bash · tor (sin VPN)';
-  document.getElementById('room-label').textContent = '(namespace por defecto)';
-} else if (roomName && useTor) {
+if (roomName && useTor) {
   document.title = 'riffle2.1 — shell · tor · ' + roomName;
   document.getElementById('title').textContent = 'bash · tor @ ' + roomName;
   document.getElementById('room-label').textContent = '(netns rfl-' + roomName + ' + tor)';
@@ -1947,9 +2464,8 @@ function sendResize() {
 function connectTermWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const qsParts = [];
-  if (roomName && !useGlobalTor) qsParts.push('room=' + encodeURIComponent(roomName));
-  if (useTor && !useGlobalTor) qsParts.push('tor=1');
-  if (useGlobalTor) qsParts.push('global_tor=1');
+  if (roomName) qsParts.push('room=' + encodeURIComponent(roomName));
+  if (useTor) qsParts.push('tor=1');
   const qs = qsParts.length ? ('?' + qsParts.join('&')) : '';
   ws = new WebSocket(proto + '//' + location.host + '/ws/terminal' + qs);
   ws.binaryType = 'arraybuffer';

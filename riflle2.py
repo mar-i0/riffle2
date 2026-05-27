@@ -36,6 +36,15 @@ OPENVPN_BIN = "/usr/sbin/openvpn"
 ROOT = Path(__file__).resolve().parent
 CACHE_FILE = ROOT / ".riflle2_cache.json"
 
+# Para VLESS reutilizamos el validador del proyecto vecino.
+_VLESS_PROJECT = Path("/home/iam/PROYECTOS/vless")
+if _VLESS_PROJECT.exists() and str(_VLESS_PROJECT) not in sys.path:
+    sys.path.insert(0, str(_VLESS_PROJECT))
+try:
+    import vless_check  # type: ignore
+except ImportError:
+    vless_check = None  # type: ignore
+
 # ip-api.com — endpoint HTTP simple, IP estable, devuelve query/countryCode/country
 GEO_HOST = "ip-api.com"
 GEO_PATH = "/line/?fields=query,countryCode,country"
@@ -562,6 +571,108 @@ def cmd_check(args) -> int:
     return 0
 
 
+def _read_vless_uri(path: Path) -> str:
+    """Primera URI no-comentario del fichero .vless."""
+    for raw in path.read_text(errors="replace").splitlines():
+        s = raw.strip()
+        if s and not s.startswith("#"):
+            return s
+    return ""
+
+
+def validate_vless_one(path: Path, timeout: float = 8.0) -> Verdict:
+    """Valida un .vless: parseo URI + DNS + TCP + (TLS) + (WS handshake).
+    No abre el túnel completo — sólo confirma que el endpoint responde como
+    debe. La IP real de salida se observa al levantar el room en la UI."""
+    if vless_check is None:
+        return Verdict(path, STATUS_DEAD,
+                       "vless_check no disponible (revisar /home/iam/PROYECTOS/vless)")
+    uri = _read_vless_uri(path)
+    if not uri:
+        return Verdict(path, STATUS_MALFORMED, "fichero sin URI vless://")
+    try:
+        rep = vless_check.run_checks(uri, timeout)
+    except ValueError as exc:
+        return Verdict(path, STATUS_MALFORMED, f"parse: {exc}")
+    if rep.ok:
+        return Verdict(path, STATUS_OK, "", "", "", "", False, 0.0)
+    # Si DNS/TCP no responden → muerto. Si llega a TLS/WS y falla → probablemente
+    # UUID/path/host equivocados (equivalente a needs_auth de OpenVPN).
+    fail = next((r for r in rep.results if not r.ok), None)
+    reason = f"{fail.name} {fail.detail}" if fail else "fallo desconocido"
+    if fail and fail.name in ("DNS", "TCP"):
+        return Verdict(path, STATUS_DEAD, reason)
+    return Verdict(path, STATUS_AUTH, reason)
+
+
+def process_vless_batch(files: list[Path], timeout: float,
+                        inbox: Path, ok_dir: Path,
+                        trash_dir: Path, auth_dir: Path) -> dict:
+    """Versión VLESS de process_batch: sólo handshake check, sin baseline."""
+    total = len(files)
+    print(f"Validando {total} fichero(s) .vless (handshake DNS/TCP/TLS/WS)")
+    print(f"Timeout por operación: {timeout}s")
+    print()
+
+    verdicts: list[Verdict] = []
+    cache = load_cache()
+    for idx, p in enumerate(files, 1):
+        try:
+            v = validate_vless_one(p, timeout=timeout)
+        except KeyboardInterrupt:
+            print("\nInterrumpido por el usuario.")
+            break
+        except Exception as exc:
+            v = Verdict(p, STATUS_DEAD, f"excepción: {exc}")
+        verdicts.append(v)
+        # Persistir en el mismo cache que OpenVPN — comparte sha1 como key.
+        cache[sha1_of(p)] = {
+            "status": v.status, "reason": v.reason,
+            "external_ip": v.external_ip, "country_code": v.country_code,
+            "country": v.country, "patched": False,
+            "bandwidth_mbps": 0.0, "ts": int(time.time()),
+            "kind": "vless",
+        }
+        print(format_line(idx, total, v))
+    save_cache(cache)
+
+    # Disposición: mismo patrón que OpenVPN
+    for v in verdicts:
+        if v.status == STATUS_OK:
+            move_to(v.path, ok_dir)
+        elif v.status == STATUS_AUTH:
+            move_to(v.path, auth_dir)
+        elif v.is_failure:
+            move_to(v.path, trash_dir)
+
+    by_status = {STATUS_OK: 0, STATUS_DEAD: 0, STATUS_AUTH: 0, STATUS_MALFORMED: 0}
+    for v in verdicts:
+        by_status[v.status] = by_status.get(v.status, 0) + 1
+    print()
+    print("=" * 60)
+    print(f"VLESS: {by_status[STATUS_OK]} OK · {by_status[STATUS_DEAD]} muertos · "
+          f"{by_status[STATUS_AUTH]} auth · {by_status[STATUS_MALFORMED]} malformed")
+    print("=" * 60)
+    return by_status
+
+
+def cmd_vless_check(args) -> int:
+    """Equivalente a `check` pero para .vless en vless_inbox/."""
+    inbox = Path(args.vless_inbox)
+    ok_dir = Path(args.vless_ok)
+    trash_dir = Path(args.vless_trash)
+    auth_dir = Path(args.vless_auth)
+    for d in (inbox, ok_dir, trash_dir, auth_dir):
+        d.mkdir(exist_ok=True)
+    files = sorted([p for p in inbox.iterdir()
+                    if p.is_file() and p.suffix.lower() == ".vless"])
+    if not files:
+        print(f"No hay .vless en {inbox}/")
+        return 0
+    process_vless_batch(files, args.timeout, inbox, ok_dir, trash_dir, auth_dir)
+    return 0
+
+
 def cmd_kill() -> int:
     """Mata todos los procesos openvpn corriendo en la máquina."""
     try:
@@ -653,6 +764,10 @@ def main() -> int:
     p.add_argument("--ok", default=str(ROOT / "ok"))
     p.add_argument("--trash", default=str(ROOT / "trash"))
     p.add_argument("--auth", default=str(ROOT / "needs_auth"))
+    p.add_argument("--vless-inbox", default=str(ROOT / "vless_inbox"))
+    p.add_argument("--vless-ok", default=str(ROOT / "vless_ok"))
+    p.add_argument("--vless-trash", default=str(ROOT / "vless_trash"))
+    p.add_argument("--vless-auth", default=str(ROOT / "vless_needs_auth"))
     p.add_argument("--timeout", type=int, default=30,
                    help="segundos por intento de conexión (default 30)")
     p.add_argument("--no-cache", action="store_true")
@@ -664,7 +779,8 @@ def main() -> int:
     p.add_argument("--kill", action="store_true",
                    help="matar todos los procesos openvpn corriendo en la máquina")
     sub = p.add_subparsers(dest="cmd", required=False)
-    sub.add_parser("check", help="valida ./inbox/ una vez")
+    sub.add_parser("check", help="valida ./inbox/ una vez (.ovpn)")
+    sub.add_parser("vless-check", help="valida ./vless_inbox/ una vez (.vless)")
     watch = sub.add_parser("watch", help="vigila ./inbox/ continuamente")
     watch.add_argument("--poll", type=float, default=3.0)
     args = p.parse_args()
@@ -672,15 +788,20 @@ def main() -> int:
     if args.kill:
         return cmd_kill()
 
+    if not args.cmd:
+        print("ERROR: especifica un subcomando (check / vless-check / watch) "
+              "o usa --kill", file=sys.stderr)
+        return 2
+
+    # vless-check no necesita openvpn ni root
+    if args.cmd == "vless-check":
+        return cmd_vless_check(args)
+
     if not Path(OPENVPN_BIN).exists():
         print(f"ERROR: {OPENVPN_BIN} no encontrado. Instala openvpn.", file=sys.stderr)
         return 2
     if os.geteuid() != 0:
         print("ERROR: necesita ejecutarse como root (openvpn levanta tun0).", file=sys.stderr)
-        return 2
-    if not args.cmd:
-        print("ERROR: especifica un subcomando (check / watch) o usa --kill",
-              file=sys.stderr)
         return 2
 
     if args.cmd == "check":

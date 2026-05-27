@@ -5,11 +5,24 @@ inbox/*
 ok/*
 needs_auth/*
 trash/*
+# Lo mismo para los URIs (vless/vmess/trojan/hy2) — contienen uuid/password/sni.
+*.vless
+*.vmess
+*.trojan
+*.hy2
+proxies_ok/*
+proxies_trash/*
+vless_inbox/*
+# Legacy (renombrados a proxies_*); por si quedan en otros clones.
+vless_ok/*
+vless_trash/*
 # Preservar los directorios vacíos en el repo
 !inbox/.gitkeep
 !ok/.gitkeep
 !needs_auth/.gitkeep
 !trash/.gitkeep
+!proxies_ok/.gitkeep
+!proxies_trash/.gitkeep
 
 # --- Estado runtime ---
 .riflle2_cache.json
